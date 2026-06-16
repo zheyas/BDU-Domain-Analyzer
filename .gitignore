@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.idea/
+reports/*.json
+reports/*.html
+reports/sqlmap_*/
+reports/skipfish_*/
+reports/wapiti_sessions/
+reports/wapiti_config/

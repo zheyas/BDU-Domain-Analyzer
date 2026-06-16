@@ -1,0 +1,1318 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчёт о безопасности: lk.nevsky-bears.ru</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #f8f9fa;
+        }
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stat-box {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .stat-box .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .stat-box .label {
+            color: #6c757d;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        .risk-score {
+            text-align: center;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        .risk-score .score {
+            font-size: 48px;
+            font-weight: bold;
+            color: #dc3545;
+        }
+        .risk-score .grade {
+            font-size: 24px;
+            color: #dc3545;
+        }
+        .findings {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .finding {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background: #f8f9fa;
+        }
+        .finding h3 {
+            margin: 0 0 10px 0;
+        }
+        .finding pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-size: 13px;
+        }
+        hr {
+            border: none;
+            border-top: 1px solid #dee2e6;
+            margin: 20px 0;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+        }
+        .badge-critical { background: #dc3545; }
+        .badge-high { background: #fd7e14; }
+        .badge-medium { background: #ffc107; color: #333; }
+        .badge-low { background: #17a2b8; }
+        .badge-info { background: #6c757d; }
+        .summary {
+            margin: 20px 0;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .summary h3 {
+            margin-top: 0;
+        }
+        .asset-section {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        .asset-section pre {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            overflow: auto;
+            max-height: 300px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔒 Отчёт о безопасности</h1>
+        <p><strong>Цель:</strong> https://lk.nevsky-bears.ru/</p>
+        <p><strong>Хост:</strong> lk.nevsky-bears.ru</p>
+        <p><strong>Дата сканирования:</strong> 2026-06-16T20:42:23.074605</p>
+        <p><strong>Длительность:</strong> 20.51 сек.</p>
+    </div>
+
+    <div class="stats">
+        <div class="stat-box">
+            <div class="number">10</div>
+            <div class="label">Всего находок</div>
+        </div>
+        <div class="stat-box">
+            <div class="number" style="color: #dc3545;">3</div>
+            <div class="label">Критических</div>
+        </div>
+        <div class="stat-box">
+            <div class="number" style="color: #fd7e14;">2</div>
+            <div class="label">Высоких</div>
+        </div>
+        <div class="stat-box">
+            <div class="number" style="color: #ffc107;">2</div>
+            <div class="label">Средних</div>
+        </div>
+        <div class="stat-box">
+            <div class="number" style="color: #17a2b8;">3</div>
+            <div class="label">Низких</div>
+        </div>
+        <div class="stat-box">
+            <div class="number" style="color: #6c757d;">0</div>
+            <div class="label">Информационных</div>
+        </div>
+    </div>
+
+    <div class="risk-score">
+        <div class="grade">Критично</div>
+        <div class="score">4</div>
+        <div style="color: #6c757d;">Оценка риска (0-100)</div>
+    </div>
+
+    <div class="summary">
+        <h3>📋 Краткое резюме</h3>
+        <p>Найдено <strong>10</strong> уязвимостей, из них:</p>
+        <ul>
+            <li><strong>3</strong> критических — требуют <strong>немедленного</strong> устранения</li>
+            <li><strong>2</strong> высоких — требуют устранения в ближайшее время</li>
+            <li><strong>2</strong> средних — требуют планового устранения</li>
+            <li><strong>3</strong> низких — рекомендуется устранить</li>
+        </ul>
+    </div>
+
+    
+    <div class="asset-section">
+        <h3>🖥️ Найденные активы</h3>
+        <pre>{
+  "target": {
+    "url": "https://lk.nevsky-bears.ru/",
+    "host": "lk.nevsky-bears.ru"
+  },
+  "token": {
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcGlLZXlJZCI6MzE1Niwic2Vzc2lvbklkIjoiN2Q5YzZiNzQtMTcwYi00ZjUyLWIzZGUtMGEwNGM2MzIyOGVkIiwiZXhwaXJlc0F0IjoiMjAyNi0wNi0yM1QxNTo0MjowNSswMDowMCIsInpvbmVJZCI6MSwiY29tcGFueUlkIjoyNjU5MywiaWF0IjoxNzgxNjI0NTI1LCJleHAiOjE3ODIyMjkzMjV9.W460fkFswb2A88RMQutFE5JqFNdLCor3PHcjEoCMavA",
+    "expiresAt": "2026-06-23T15:42:05+00:00",
+    "level": "company"
+  },
+  "users_count": 0,
+  "roles": [
+    {
+      "id": 78137,
+      "name": "Администратор",
+      "permissions": [
+        "views.joins",
+        "views.lessons",
+        "views.clients",
+        "views.leads",
+        "views.history",
+        "views.company",
+        "views.company.managers",
+        "views.company.filials",
+        "views.company.rooms",
+        "views.reports.funnel",
+        "views.reports.visits",
+        "views.reports.salary",
+        "views.reports.subscriptions",
+        "views.reports.academic",
+        "views.calls",
+        "views.tasks",
+        "views.subscriptions",
+        "views.subscriptions.types",
+        "views.subscriptions.control",
+        "views.subscriptions.list",
+        "views.birthdays",
+        "views.reports",
+        "views.reports.analytic",
+        "views.reports.payments",
+        "views.reports.products",
+        "views.mailing",
+        "views.mailing.mail",
+        "views.mailing.templates",
+        "views.site",
+        "views.salary",
+        "views.salary.managers",
+        "views.salary.rates",
+        "views.salary.sheet",
+        "views.salary.shifts",
+        "views.salary.settings",
+        "views.finance",
+        "views.finance.cashflows",
+        "views.finance.categories",
+        "views.account",
+        "views.account.licenses",
+        "views.account.bills",
+        "views.account.payments",
+        "views.account.entity",
+        "views.settings",
+        "views.settings.notifications",
+        "views.settings.clients",
+        "views.settings.classes",
+        "views.settings.sells",
+        "views.settings.integrations",
+        "views.settings.tasks",
+        "views.settings.payments",
+        "views.settings.doctemplates",
+        "views.settings.api",
+        "views.settings.lk",
+        "views.client",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.products",
+        "views.client.payments",
+        "views.client.comments",
+        "views.client.history",
+        "views.client.tasks",
+        "views.client.personal",
+        "views.client.contract",
+        "views.client.calls",
+        "views.client.mailings",
+        "views.client.lessons",
+        "views.classes",
+        "views.class",
+        "views.class.records",
+        "views.class.joins",
+        "views.class.lessons",
+        "views.class.settings",
+        "views.warehouse",
+        "views.warehouse.leftovers",
+        "views.warehouse.products",
+        "views.warehouse.supplies",
+        "views.warehouse.contractors",
+        "views.reports.business",
+        "views.finance.prediction",
+        "views.client.family",
+        "views.finance.cashboxes",
+        "views.settings.loyalty_program",
+        "views.client.loyalty_program",
+        "actions.chats.15484.exists_client_access.any",
+        "actions.chats.15484.new_client_access",
+        "actions.join.create",
+        "actions.join.edit",
+        "actions.join.delete",
+        "actions.join.status",
+        "actions.class.create",
+        "actions.class.edit",
+        "actions.class.delete",
+        "actions.class.status",
+        "actions.client.create",
+        "actions.client.edit",
+        "actions.client.delete",
+        "actions.client.merge",
+        "actions.client.import",
+        "actions.client.export",
+        "actions.client.status",
+        "actions.payment.create",
+        "actions.payment.edit",
+        "actions.payment.delete",
+        "actions.payment.refund",
+        "actions.payment.print_payment_kkm",
+        "actions.payment.print_refund_kkm",
+        "actions.payment.print_exists_kkm",
+        "actions.payment.receipt_viewing",
+        "actions.invoice.delete",
+        "actions.salary.accrual",
+        "actions.salary.payment",
+        "actions.salary.export",
+        "actions.salary.shifts.log",
+        "actions.subscription.create",
+        "actions.subscription.edit",
+        "actions.subscription.delete",
+        "actions.sale.edit",
+        "actions.sale.delete",
+        "actions.lesson.create",
+        "actions.lesson.create_non_work_hours_teacher",
+        "actions.lesson.create_non_work_hours_room",
+        "actions.lesson.edit_theme_and_description",
+        "actions.lesson.edit_main_info",
+        "actions.lesson.edit_non_work_hours_teacher",
+        "actions.lesson.edit_non_work_hours_room",
+        "actions.lesson.status",
+        "actions.lesson.delete",
+        "actions.lesson.delete_non_work_hours_teacher",
+        "actions.lesson.delete_non_work_hours_room",
+        "actions.lesson.record",
+        "actions.mailing.create",
+        "actions.mailing_template.edit",
+        "actions.settings.api",
+        "actions.settings.lk",
+        "actions.marks_tasks.mark_view",
+        "actions.marks_tasks.mark_set",
+        "actions.marks_tasks.task_create",
+        "actions.marks_tasks.task_edit",
+        "actions.marks_tasks.task_delete",
+        "actions.marks_tasks.task_file_add",
+        "actions.marks_tasks.task_file_delete",
+        "actions.marks_tasks.set_webinar",
+        "actions.marks_tasks.set_video",
+        "actions.tasks.create",
+        "actions.tasks.edit_own",
+        "actions.tasks.edit_mine",
+        "actions.tasks.edit_other",
+        "actions.tasks.comment_add",
+        "actions.tasks.comment_delete_own",
+        "actions.tasks.comment_delete_other",
+        "actions.tasks.remove_own",
+        "actions.tasks.remove_mine",
+        "actions.tasks.remove_other",
+        "actions.tasks.success_own",
+        "actions.tasks.success_mine",
+        "actions.tasks.success_other",
+        "actions.marks_tasks.answer_view",
+        "actions.marks_tasks.answer_change",
+        "actions.marks_tasks.answer_status",
+        "actions.finance.view",
+        "actions.finance.delete",
+        "actions.finance.income",
+        "actions.finance.expense",
+        "actions.finance.edit",
+        "actions.finance.export",
+        "actions.finance.category_create",
+        "actions.finance.category_edit",
+        "actions.finance.category_delete",
+        "actions.docs.create",
+        "actions.docs.edit",
+        "actions.docs.delete",
+        "actions.files.download",
+        "actions.files.upload",
+        "actions.files.delete",
+        "actions.warehouse.product_create",
+        "actions.warehouse.product_edit",
+        "actions.warehouse.product_delete",
+        "actions.warehouse.supply_create",
+        "actions.warehouse.supply_edit",
+        "actions.warehouse.supply_delete",
+        "actions.warehouse.contractor_create",
+        "actions.warehouse.contractor_edit",
+        "actions.warehouse.contractor_delete",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_own",
+        "actions.user_comments.edit_other",
+        "actions.user_comments.delete_own",
+        "actions.user_comments.delete_other",
+        "actions.lesson.create_in_work_off",
+        "actions.finance.cashbox.view",
+        "actions.finance.cashbox.create",
+        "actions.finance.cashbox.edit",
+        "actions.finance.cashbox.delete",
+        "actions.finance.cashbox.funds_create",
+        "actions.finance.cashbox.funds_edit",
+        "actions.finance.cashbox.funds_delete",
+        "actions.finance.cashbox.transfer_create",
+        "actions.finance.cashbox.transfer_edit",
+        "actions.finance.cashbox.transfer_delete",
+        "actions.finance.cashbox.export",
+        "actions.finance.cashbox.operations_without_cashbox",
+        "actions.loyalty_program.bonus_operation_create",
+        "actions.loyalty_program.bonus_operation_edit",
+        "actions.loyalty_program.bonus_operation_delete",
+        "actions.loyalty_program.bonus_level_create",
+        "actions.loyalty_program.bonus_level_edit",
+        "actions.loyalty_program.bonus_level_delete",
+        "general.teacher",
+        "general.edit_managers",
+        "tasks.78137",
+        "tasks.78139",
+        "tasks.78138",
+        "tasks.83122",
+        "tasks.103312",
+        "tasks.109000",
+        "tasks.109007",
+        "tasks.109011",
+        "tasks.109522",
+        "salary.78137",
+        "salary.78139",
+        "salary.78138",
+        "salary.83122",
+        "salary.103312",
+        "salary.109000",
+        "salary.109007",
+        "salary.109011",
+        "salary.109522",
+        "view_data.additional_info",
+        "view_data.contact",
+        "view_data.income",
+        "view_data.balance",
+        "view_data.class_debts",
+        "view_data.class_price",
+        "view_data.yield",
+        "lesson_access.all",
+        "lesson_action_access.all",
+        "lesson_create_access.all",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.all",
+        "funds_access.all",
+        "actions.chats.16279.exists_client_access.all",
+        "actions.chats.16279.hide_chats",
+        "actions.chats.16279.exists_client_access.all",
+        "actions.chats.16279.hide_chats",
+        "tasks.119582",
+        "salary.119582",
+        "tasks.126563",
+        "salary.126563",
+        "actions.docs.generate_taxdeducation",
+        "tasks.130865",
+        "salary.130865",
+        "views.birthdays.clients",
+        "views.birthdays.managers",
+        "view_data.consents",
+        "actions.support.ticket_create",
+        "actions.support.view_other_managers_tickets",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2022-11-07T08:51:10+00:00"
+    },
+    {
+      "id": 78138,
+      "name": "Менеджер",
+      "permissions": [
+        "views.joins",
+        "views.lessons",
+        "views.clients",
+        "views.leads",
+        "views.reports.funnel",
+        "views.reports.visits",
+        "views.reports.subscriptions",
+        "views.reports.payments",
+        "views.mailing",
+        "views.mailing.mail",
+        "views.mailing.templates",
+        "views.reports",
+        "views.calls",
+        "views.tasks",
+        "views.subscriptions",
+        "views.subscriptions.types",
+        "views.subscriptions.control",
+        "views.subscriptions.list",
+        "views.birthdays",
+        "views.client",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.payments",
+        "views.client.comments",
+        "views.client.tasks",
+        "views.client.personal",
+        "views.client.contract",
+        "views.client.calls",
+        "views.client.mailings",
+        "views.client.lessons",
+        "views.classes",
+        "views.class",
+        "views.class.records",
+        "views.class.joins",
+        "views.class.lessons",
+        "views.class.settings",
+        "views.client.family",
+        "views.salary",
+        "views.salary.managers",
+        "views.reports.analytic",
+        "views.settings",
+        "views.settings.lk",
+        "views.client.history",
+        "views.birthdays.clients",
+        "actions.chats.15484.exists_client_access.resp",
+        "actions.chats.15484.new_client_access",
+        "actions.chats.16279.exists_client_access.own",
+        "actions.client.create",
+        "actions.client.edit",
+        "actions.client.import",
+        "actions.client.export",
+        "actions.client.status",
+        "actions.payment.receipt_viewing",
+        "actions.subscription.create",
+        "actions.lesson.status",
+        "actions.lesson.record",
+        "actions.mailing.create",
+        "actions.mailing_template.edit",
+        "actions.tasks.edit_mine",
+        "actions.tasks.comment_add",
+        "actions.tasks.comment_delete_own",
+        "actions.tasks.remove_own",
+        "actions.tasks.success_own",
+        "actions.tasks.success_mine",
+        "actions.tasks.success_other",
+        "actions.docs.create",
+        "actions.docs.edit",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_own",
+        "actions.user_comments.delete_own",
+        "actions.join.create",
+        "actions.join.edit",
+        "actions.join.status",
+        "actions.subscription.edit",
+        "tasks.109000",
+        "salary.109000",
+        "view_data.additional_info",
+        "view_data.contact",
+        "view_data.income",
+        "view_data.balance",
+        "view_data.class_debts",
+        "view_data.class_price",
+        "view_data.yield",
+        "lesson_access.all",
+        "lesson_action_access.all",
+        "lesson_create_access.all",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2022-11-07T08:51:10+00:00"
+    },
+    {
+      "id": 78139,
+      "name": "Преподаватель",
+      "permissions": [
+        "views.lessons",
+        "views.tasks",
+        "views.class",
+        "views.class.lessons",
+        "views.birthdays",
+        "views.client.personal",
+        "views.client",
+        "views.salary",
+        "views.salary.managers",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.payments",
+        "views.client.family",
+        "views.class.records",
+        "views.classes",
+        "views.client.lessons",
+        "views.class.joins",
+        "views.salary.sheet",
+        "views.reports",
+        "views.reports.funnel",
+        "views.birthdays.clients",
+        "actions.lesson.record",
+        "actions.marks_tasks.mark_view",
+        "actions.marks_tasks.mark_set",
+        "actions.marks_tasks.task_create",
+        "actions.marks_tasks.task_edit",
+        "actions.marks_tasks.task_delete",
+        "actions.marks_tasks.task_file_add",
+        "actions.marks_tasks.task_file_delete",
+        "actions.marks_tasks.set_webinar",
+        "actions.marks_tasks.set_video",
+        "actions.marks_tasks.answer_status",
+        "actions.marks_tasks.answer_view",
+        "actions.marks_tasks.answer_change",
+        "actions.lesson.status",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_own",
+        "actions.past_period.edit_with_restrict",
+        "general.teacher",
+        "view_data.contact",
+        "view_data.additional_info",
+        "view_data.balance",
+        "lesson_access.own",
+        "lesson_action_access.own",
+        "lesson_create_access.self",
+        "class_access.own",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own"
+      ],
+      "createdAt": "2022-11-07T08:51:10+00:00"
+    },
+    {
+      "id": 83122,
+      "name": "Главный менеджер",
+      "permissions": [
+        "views.joins",
+        "views.leads",
+        "views.classes",
+        "views.lessons",
+        "views.clients",
+        "views.calls",
+        "views.tasks",
+        "views.subscriptions",
+        "views.subscriptions.types",
+        "views.subscriptions.control",
+        "views.subscriptions.list",
+        "views.company",
+        "views.company.managers",
+        "views.company.filials",
+        "views.company.rooms",
+        "views.birthdays",
+        "views.reports",
+        "views.reports.funnel",
+        "views.reports.visits",
+        "views.reports.subscriptions",
+        "views.reports.academic",
+        "views.reports.products",
+        "views.reports.payments",
+        "views.mailing",
+        "views.mailing.mail",
+        "views.mailing.templates",
+        "views.site",
+        "views.settings",
+        "views.settings.notifications",
+        "views.settings.clients",
+        "views.settings.sells",
+        "views.settings.integrations",
+        "views.settings.tasks",
+        "views.settings.payments",
+        "views.settings.doctemplates",
+        "views.settings.api",
+        "views.settings.lk",
+        "views.settings.classes",
+        "views.client",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.products",
+        "views.client.history",
+        "views.client.lessons",
+        "views.client.mailings",
+        "views.client.calls",
+        "views.client.contract",
+        "views.client.personal",
+        "views.client.tasks",
+        "views.client.comments",
+        "views.client.payments",
+        "views.history",
+        "views.class",
+        "views.class.joins",
+        "views.class.records",
+        "views.class.lessons",
+        "views.class.settings",
+        "views.reports.business",
+        "views.client.family",
+        "views.salary",
+        "views.salary.managers",
+        "views.reports.salary",
+        "views.reports.analytic",
+        "views.salary.rates",
+        "views.salary.sheet",
+        "views.salary.shifts",
+        "views.salary.settings",
+        "views.finance",
+        "views.finance.cashflows",
+        "views.finance.categories",
+        "views.finance.cashboxes",
+        "views.finance.prediction",
+        "views.account",
+        "views.account.licenses",
+        "views.account.bills",
+        "views.account.payments",
+        "views.account.entity",
+        "views.warehouse",
+        "views.warehouse.leftovers",
+        "views.warehouse.products",
+        "views.warehouse.supplies",
+        "views.warehouse.contractors",
+        "views.settings.loyalty_program",
+        "actions.chats.15484.exists_client_access.any",
+        "actions.chats.15484.new_client_access",
+        "actions.chats.16279.exists_client_access.all",
+        "actions.chats.16279.hide_chats",
+        "actions.class.create",
+        "actions.class.edit",
+        "actions.class.delete",
+        "actions.class.status",
+        "actions.client.create",
+        "actions.client.edit",
+        "actions.client.delete",
+        "actions.client.status",
+        "actions.client.import",
+        "actions.client.export",
+        "actions.client.merge",
+        "actions.join.status",
+        "actions.join.delete",
+        "actions.join.edit",
+        "actions.join.create",
+        "actions.payment.create",
+        "actions.payment.edit",
+        "actions.payment.delete",
+        "actions.payment.refund",
+        "actions.payment.print_payment_kkm",
+        "actions.payment.print_refund_kkm",
+        "actions.payment.print_exists_kkm",
+        "actions.payment.receipt_viewing",
+        "actions.subscription.edit",
+        "actions.subscription.delete",
+        "actions.sale.edit",
+        "actions.sale.delete",
+        "actions.invoice.delete",
+        "actions.lesson.create",
+        "actions.lesson.create_non_work_hours_teacher",
+        "actions.lesson.create_non_work_hours_room",
+        "actions.lesson.edit_main_info",
+        "actions.lesson.edit_theme_and_description",
+        "actions.lesson.edit_non_work_hours_teacher",
+        "actions.lesson.edit_non_work_hours_room",
+        "actions.lesson.delete",
+        "actions.lesson.delete_non_work_hours_teacher",
+        "actions.lesson.delete_non_work_hours_room",
+        "actions.lesson.record",
+        "actions.lesson.status",
+        "actions.marks_tasks.mark_view",
+        "actions.marks_tasks.mark_set",
+        "actions.marks_tasks.task_create",
+        "actions.marks_tasks.task_edit",
+        "actions.marks_tasks.task_delete",
+        "actions.marks_tasks.task_file_add",
+        "actions.marks_tasks.task_file_delete",
+        "actions.marks_tasks.set_webinar",
+        "actions.marks_tasks.set_video",
+        "actions.marks_tasks.answer_view",
+        "actions.marks_tasks.answer_change",
+        "actions.marks_tasks.answer_status",
+        "actions.mailing.create",
+        "actions.mailing_template.edit",
+        "actions.tasks.create",
+        "actions.tasks.edit_own",
+        "actions.tasks.edit_mine",
+        "actions.tasks.edit_other",
+        "actions.tasks.remove_own",
+        "actions.tasks.remove_mine",
+        "actions.tasks.remove_other",
+        "actions.tasks.success_own",
+        "actions.tasks.success_mine",
+        "actions.tasks.success_other",
+        "actions.tasks.comment_add",
+        "actions.tasks.comment_delete_own",
+        "actions.tasks.comment_delete_other",
+        "actions.docs.create",
+        "actions.docs.edit",
+        "actions.docs.delete",
+        "actions.files.upload",
+        "actions.files.download",
+        "actions.files.delete",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.edit_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_other",
+        "actions.user_comments.delete_own",
+        "actions.user_comments.delete_other",
+        "actions.salary.accrual",
+        "actions.salary.export",
+        "actions.lesson.create_in_work_off",
+        "actions.salary.payment",
+        "actions.salary.shifts.log",
+        "actions.finance.view",
+        "actions.finance.delete",
+        "actions.finance.income",
+        "actions.finance.expense",
+        "actions.finance.edit",
+        "actions.finance.export",
+        "actions.finance.category_create",
+        "actions.finance.category_edit",
+        "actions.finance.category_delete",
+        "actions.finance.cashbox.view",
+        "actions.finance.cashbox.create",
+        "actions.finance.cashbox.delete",
+        "actions.finance.cashbox.edit",
+        "actions.finance.cashbox.export",
+        "actions.finance.cashbox.funds_delete",
+        "actions.finance.cashbox.funds_edit",
+        "actions.finance.cashbox.funds_create",
+        "actions.finance.cashbox.transfer_create",
+        "actions.finance.cashbox.transfer_edit",
+        "actions.finance.cashbox.transfer_delete",
+        "actions.finance.cashbox.operations_without_cashbox",
+        "actions.warehouse.product_create",
+        "actions.warehouse.product_delete",
+        "actions.warehouse.product_edit",
+        "actions.warehouse.contractor_create",
+        "actions.warehouse.contractor_edit",
+        "actions.warehouse.contractor_delete",
+        "actions.warehouse.supply_create",
+        "actions.warehouse.supply_delete",
+        "actions.warehouse.supply_edit",
+        "actions.docs.generate_taxdeducation",
+        "general.edit_managers",
+        "tasks.78137",
+        "tasks.78138",
+        "tasks.78139",
+        "tasks.109000",
+        "tasks.109007",
+        "tasks.119582",
+        "salary.83122",
+        "salary.78139",
+        "salary.78137",
+        "salary.78138",
+        "salary.109007",
+        "salary.109011",
+        "salary.119582",
+        "view_data.additional_info",
+        "view_data.contact",
+        "view_data.income",
+        "view_data.balance",
+        "view_data.class_debts",
+        "view_data.class_price",
+        "view_data.yield",
+        "lesson_access.all",
+        "lesson_action_access.all",
+        "lesson_create_access.all",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "views.birthdays.clients",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2023-01-30T12:00:17+00:00"
+    },
+    {
+      "id": 109522,
+      "name": "Event менеджер",
+      "permissions": [
+        "views.clients",
+        "views.birthdays",
+        "views.client",
+        "views.client.personal",
+        "views.client.family",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.lessons",
+        "views.class.joins",
+        "views.class",
+        "views.class.records",
+        "lesson_access.all",
+        "lesson_action_access.all",
+        "lesson_create_access.all",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "views.birthdays.clients",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2024-03-29T11:00:17+00:00"
+    },
+    {
+      "id": 119582,
+      "name": "ЛИД Менеджер",
+      "permissions": [
+        "views.joins",
+        "views.lessons",
+        "views.clients",
+        "views.leads",
+        "views.reports.funnel",
+        "views.mailing",
+        "views.mailing.mail",
+        "views.mailing.templates",
+        "views.reports",
+        "views.calls",
+        "views.tasks",
+        "views.subscriptions",
+        "views.subscriptions.types",
+        "views.subscriptions.control",
+        "views.subscriptions.list",
+        "views.birthdays",
+        "views.client",
+        "views.client.classes",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.payments",
+        "views.client.comments",
+        "views.client.tasks",
+        "views.client.personal",
+        "views.client.contract",
+        "views.client.calls",
+        "views.client.mailings",
+        "views.client.lessons",
+        "views.classes",
+        "views.class",
+        "views.class.records",
+        "views.class.joins",
+        "views.class.lessons",
+        "views.class.settings",
+        "views.client.family",
+        "views.salary",
+        "views.salary.managers",
+        "views.settings",
+        "views.settings.lk",
+        "views.client.history",
+        "actions.chats.15484.exists_client_access.resp",
+        "actions.chats.15484.new_client_access",
+        "actions.chats.16279.exists_client_access.own",
+        "actions.client.create",
+        "actions.client.edit",
+        "actions.client.import",
+        "actions.client.export",
+        "actions.client.status",
+        "actions.subscription.create",
+        "actions.tasks.edit_mine",
+        "actions.tasks.comment_add",
+        "actions.tasks.comment_delete_own",
+        "actions.tasks.remove_own",
+        "actions.tasks.success_own",
+        "actions.tasks.success_mine",
+        "actions.tasks.success_other",
+        "actions.docs.create",
+        "actions.docs.edit",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_own",
+        "actions.user_comments.delete_own",
+        "actions.join.create",
+        "actions.join.edit",
+        "actions.join.status",
+        "tasks.109000",
+        "salary.109000",
+        "view_data.additional_info",
+        "view_data.contact",
+        "view_data.income",
+        "view_data.balance",
+        "view_data.class_debts",
+        "view_data.class_price",
+        "view_data.yield",
+        "lesson_access.all",
+        "lesson_action_access.all",
+        "lesson_create_access.all",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "views.birthdays.clients",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2024-09-25T09:41:12+00:00"
+    },
+    {
+      "id": 126563,
+      "name": "Руководитель группы тренеров",
+      "permissions": [
+        "views.lessons",
+        "views.classes",
+        "views.clients",
+        "views.reports",
+        "views.reports.visits",
+        "views.reports.funnel",
+        "views.birthdays",
+        "views.tasks",
+        "views.salary.managers",
+        "views.salary",
+        "views.salary.sheet",
+        "views.client.classes",
+        "views.client",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.payments",
+        "views.client.lessons",
+        "views.client.family",
+        "views.class.joins",
+        "views.class",
+        "views.class.records",
+        "views.class.lessons",
+        "views.birthdays.clients",
+        "actions.lesson.record",
+        "actions.lesson.status",
+        "actions.marks_tasks.mark_set",
+        "actions.marks_tasks.mark_view",
+        "actions.marks_tasks.task_create",
+        "actions.marks_tasks.task_edit",
+        "actions.marks_tasks.task_delete",
+        "actions.marks_tasks.task_file_add",
+        "actions.marks_tasks.task_file_delete",
+        "actions.marks_tasks.set_webinar",
+        "actions.marks_tasks.set_video",
+        "actions.marks_tasks.answer_view",
+        "actions.marks_tasks.answer_change",
+        "actions.marks_tasks.answer_status",
+        "actions.user_comments.create",
+        "actions.user_comments.view_own",
+        "actions.user_comments.view_other",
+        "actions.user_comments.edit_own",
+        "actions.user_comments.delete_own",
+        "view_data.additional_info",
+        "view_data.contact",
+        "view_data.balance",
+        "view_data.class_debts",
+        "lesson_access.all",
+        "lesson_action_access.own",
+        "lesson_create_access.self",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2025-01-21T06:40:53+00:00"
+    },
+    {
+      "id": 130865,
+      "name": "Эвент",
+      "permissions": [
+        "views.classes",
+        "views.clients",
+        "views.birthdays",
+        "views.client.classes",
+        "views.client",
+        "views.client.records",
+        "views.client.subscriptions",
+        "views.client.personal",
+        "views.class.joins",
+        "views.class",
+        "views.class.records",
+        "views.class.lessons",
+        "lesson_access.all",
+        "lesson_action_access.own",
+        "lesson_create_access.self",
+        "class_access.all",
+        "client_access.all",
+        "cashbox_access.own",
+        "funds_access.own",
+        "views.birthdays.clients",
+        "actions.past_period.edit_without_restrict"
+      ],
+      "createdAt": "2025-04-15T07:40:10+00:00"
+    }
+  ],
+  "server": "nginx",
+  "admin_paths": [
+    {
+      "path": "/admin",
+      "status": 200
+    },
+    {
+      "path": "/admin/",
+      "status": 200
+    },
+    {
+      "path": "/admin/login",
+      "status": 200
+    },
+    {
+      "path": "/admin/dashboard",
+      "status": 200
+    },
+    {
+      "path": "/administrator",
+      "status": 200
+    },
+    {
+      "path": "/adminer.php",
+      "status": 200
+    }
+  ],
+  "dns": {
+    "ip": "31.31.198.142"
+  }
+}</pre>
+    </div>
+    
+
+    <div class="findings">
+        <h2>🔍 Детальный список находок</h2>
+        
+        <div class="finding" style="border-left: 4px solid #dc3545;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔴 Публичный эндпоинт выдачи API токена без авторизации</h3>
+                <span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">
+                    CRITICAL
+                </span>
+            </div>
+            <p><strong>Категория:</strong> Authentication</p>
+            <p><strong>Описание:</strong> Эндпоинт возвращает валидный accessToken без какой-либо аутентификации. Токен позволяет обращаться к API от имени компании.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/api/v1/company/auth/getToken
+Токен: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcGlLZXlJZ...
+Уровень: company
+Истекает: 2026-06-23T15:42:05+00:00</pre>
+            <p><strong>Решение:</strong> 1. Немедленно закрыть эндпоинт на публичном контуре
+2. Внедрить механизм аутентификации
+3. Ограничить TTL токена до 1 часа
+4. Ограничить scope токена</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/api/v1/company/auth/getToken" target="_blank">https://lk.nevsky-bears.ru/api/v1/company/auth/getToken</a></p>
+            <p><strong>CWE:</strong> CWE-306, CWE-287, CWE-200</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #dc3545;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔴 Доступ к данным 0 пользователей компании</h3>
+                <span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">
+                    CRITICAL
+                </span>
+            </div>
+            <p><strong>Категория:</strong> Information Disclosure</p>
+            <p><strong>Описание:</strong> Получен доступ к полной базе пользователей (0 записей). Данные включают ФИО, email, телефоны, финансовую информацию.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/api/v1/company/users
+Количество пользователей: 0
+Первый пользователь: N/A</pre>
+            <p><strong>Решение:</strong> 1. Немедленно закрыть доступ к эндпоинту
+2. Внедрить проверку прав доступа
+3. Проверить логи на предмет несанкционированного доступа</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/api/v1/company/users" target="_blank">https://lk.nevsky-bears.ru/api/v1/company/users</a></p>
+            <p><strong>CWE:</strong> CWE-200, CWE-284, CWE-359</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #dc3545;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔴 Adminer доступен публично</h3>
+                <span style="background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px;">
+                    CRITICAL
+                </span>
+            </div>
+            <p><strong>Категория:</strong> Web Exposure</p>
+            <p><strong>Описание:</strong> Adminer (инструмент управления БД) доступен из интернета.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/adminer.php
+Страница загружается</pre>
+            <p><strong>Решение:</strong> 1. Удалить Adminer с публичного сервера
+2. Или ограничить доступ по IP
+3. Использовать только через VPN</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/adminer.php" target="_blank">https://lk.nevsky-bears.ru/adminer.php</a></p>
+            <p><strong>CWE:</strong> CWE-284, CWE-306</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #fd7e14;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🟠 Доступ к структуре ролей и прав (8 ролей)</h3>
+                <span style="background: #fd7e14; color: white; padding: 2px 8px; border-radius: 4px;">
+                    HIGH
+                </span>
+            </div>
+            <p><strong>Категория:</strong> Information Disclosure</p>
+            <p><strong>Описание:</strong> Получен доступ к полной структуре ролей и прав доступа в системе.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/api/v1/company/roles
+Ролей: 8</pre>
+            <p><strong>Решение:</strong> Закрыть доступ к эндпоинту для пользователей без прав администратора</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/api/v1/company/roles" target="_blank">https://lk.nevsky-bears.ru/api/v1/company/roles</a></p>
+            <p><strong>CWE:</strong> CWE-200, CWE-284</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #fd7e14;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🟠 Административная панель доступна из интернета</h3>
+                <span style="background: #fd7e14; color: white; padding: 2px 8px; border-radius: 4px;">
+                    HIGH
+                </span>
+            </div>
+            <p><strong>Категория:</strong> Web Exposure</p>
+            <p><strong>Описание:</strong> Административная панель доступна по стандартному пути.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/admin
+Статус: 200</pre>
+            <p><strong>Решение:</strong> 1. Ограничить доступ по IP
+2. Закрыть на уровне веб-сервера
+3. Использовать VPN для доступа</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/admin" target="_blank">https://lk.nevsky-bears.ru/admin</a></p>
+            <p><strong>CWE:</strong> CWE-284</p>
+            
+            <p><strong>Уверенность:</strong> MEDIUM</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #ffc107;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🟡 Отсутствует HSTS (Strict-Transport-Security)</h3>
+                <span style="background: #ffc107; color: white; padding: 2px 8px; border-radius: 4px;">
+                    MEDIUM
+                </span>
+            </div>
+            <p><strong>Категория:</strong> HTTP Headers</p>
+            <p><strong>Описание:</strong> В ответе не найден заголовок strict-transport-security.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/
+Отсутствует: strict-transport-security</pre>
+            <p><strong>Решение:</strong> Добавьте: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/" target="_blank">https://lk.nevsky-bears.ru/</a></p>
+            <p><strong>CWE:</strong> CWE-319</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #ffc107;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🟡 Отсутствует CSP (Content-Security-Policy)</h3>
+                <span style="background: #ffc107; color: white; padding: 2px 8px; border-radius: 4px;">
+                    MEDIUM
+                </span>
+            </div>
+            <p><strong>Категория:</strong> HTTP Headers</p>
+            <p><strong>Описание:</strong> В ответе не найден заголовок content-security-policy.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/
+Отсутствует: content-security-policy</pre>
+            <p><strong>Решение:</strong> Добавьте: Content-Security-Policy: default-src 'self'; script-src 'self'</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/" target="_blank">https://lk.nevsky-bears.ru/</a></p>
+            <p><strong>CWE:</strong> CWE-693</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #17a2b8;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔵 Отсутствует X-Frame-Options</h3>
+                <span style="background: #17a2b8; color: white; padding: 2px 8px; border-radius: 4px;">
+                    LOW
+                </span>
+            </div>
+            <p><strong>Категория:</strong> HTTP Headers</p>
+            <p><strong>Описание:</strong> В ответе не найден заголовок x-frame-options.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/
+Отсутствует: x-frame-options</pre>
+            <p><strong>Решение:</strong> Добавьте: X-Frame-Options: DENY (или SAMEORIGIN)</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/" target="_blank">https://lk.nevsky-bears.ru/</a></p>
+            <p><strong>CWE:</strong> CWE-1021</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #17a2b8;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔵 Отсутствует X-Content-Type-Options</h3>
+                <span style="background: #17a2b8; color: white; padding: 2px 8px; border-radius: 4px;">
+                    LOW
+                </span>
+            </div>
+            <p><strong>Категория:</strong> HTTP Headers</p>
+            <p><strong>Описание:</strong> В ответе не найден заголовок x-content-type-options.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/
+Отсутствует: x-content-type-options</pre>
+            <p><strong>Решение:</strong> Добавьте: X-Content-Type-Options: nosniff</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/" target="_blank">https://lk.nevsky-bears.ru/</a></p>
+            <p><strong>CWE:</strong> CWE-16</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+        <div class="finding" style="border-left: 4px solid #17a2b8;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3>🔵 Отсутствует Referrer-Policy</h3>
+                <span style="background: #17a2b8; color: white; padding: 2px 8px; border-radius: 4px;">
+                    LOW
+                </span>
+            </div>
+            <p><strong>Категория:</strong> HTTP Headers</p>
+            <p><strong>Описание:</strong> В ответе не найден заголовок referrer-policy.</p>
+            <pre style="background: #f8f9fa; padding: 10px; border-radius: 4px; overflow: auto; max-height: 200px;">URL: https://lk.nevsky-bears.ru/
+Отсутствует: referrer-policy</pre>
+            <p><strong>Решение:</strong> Добавьте: Referrer-Policy: strict-origin-when-cross-origin</p>
+            <p><strong>URL:</strong> <a href="https://lk.nevsky-bears.ru/" target="_blank">https://lk.nevsky-bears.ru/</a></p>
+            <p><strong>CWE:</strong> CWE-200</p>
+            
+            <p><strong>Уверенность:</strong> HIGH</p>
+        </div>
+        <hr>
+        
+    </div>
+
+    <div style="text-align: center; padding: 20px; color: #6c757d; font-size: 12px;">
+        <p>Отчёт сгенерирован автоматически при помощи BDU Domain Security Scanner</p>
+        <p>Время генерации: 2026-06-16 20:42:23</p>
+    </div>
+</body>
+</html>
