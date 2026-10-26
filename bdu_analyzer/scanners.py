@@ -1,31 +1,50 @@
 # -*- coding: utf-8 -*-
 
+import ipaddress
+import hashlib
 import json
+import os
 import re
+import signal
 import shutil
 import socket
 import ssl
 import subprocess
 import tempfile
 import time
+import uuid
+import sys
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin, urlparse
+from typing import Any, Callable
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from .bdu import BDUHandler, extract_cves
 from .config import (
     EXTERNAL_TIMEOUTS,
-    LEGACY_WAPITI_BIN,
+    FULL_COMPLETION_TIMEOUTS,
     MAX_HTML_BYTES,
     REPORTS_DIR,
     REQUEST_TIMEOUT,
+    RULES_DIR,
+    SCANNER_SOURCE_DIRS,
     WORDLIST_DIR,
 )
 from .models import Finding, ScanContext, ScanReport, ToolStatus
+from .installer import (
+    find_tool_binary,
+    install_missing_tools,
+    scanner_runtime_details,
+    scanner_source_inventory,
+    source_available,
+    tool_environment,
+)
+from .progress import LOGGER, PROGRESS, configure_logging, emit
+from .source_integrations import legion_device_profile
 from .target import base_url, safe_filename
 
 
@@ -70,28 +89,63 @@ INTERESTING_PATHS = [
 COMMON_TCP_PORTS = {
     21: "ftp",
     22: "ssh",
+    23: "telnet",
     25: "smtp",
     53: "dns",
     80: "http",
+    88: "kerberos",
     110: "pop3",
+    111: "rpcbind",
     143: "imap",
+    389: "ldap",
     443: "https",
     445: "smb",
     465: "smtps",
     587: "submission",
+    631: "ipp",
+    636: "ldaps",
+    873: "rsync",
+    990: "ftps",
     993: "imaps",
     995: "pop3s",
     1433: "mssql",
     1521: "oracle",
+    2049: "nfs",
+    2375: "docker",
+    2376: "docker-tls",
     3306: "mysql",
     3389: "rdp",
     5432: "postgresql",
     5900: "vnc",
+    5985: "winrm",
+    5986: "winrm-tls",
     6379: "redis",
+    6443: "kubernetes-api",
     8080: "http-alt",
+    8291: "mikrotik-winbox",
     8443: "https-alt",
     9200: "elasticsearch",
+    9100: "jetdirect",
+    10250: "kubelet",
     27017: "mongodb",
+}
+
+DISCOVERY_TCP_PORTS = (22, 53, 80, 135, 139, 443, 445, 3389, 5985, 8080, 8443, 9100)
+WINDOWS_PORTS = {135, 139, 445, 3389, 5985, 5986}
+DATABASE_PORTS = {1433, 1521, 3306, 5432, 6379, 9200, 27017}
+WEB_PORTS = {80, 443, 8080, 8443}
+FULL_TCP_PORT_MIN = 1
+FULL_TCP_PORT_MAX = 65535
+FULL_TCP_SCAN_WORKERS = 256
+FULL_TCP_SCAN_TIMEOUT = 0.08
+FILE_SERVICE_PORTS = {
+    21: "FTP",
+    139: "NetBIOS/SMB",
+    445: "SMB",
+    111: "RPC/NFS",
+    2049: "NFS",
+    873: "rsync",
+    990: "FTPS",
 }
 
 NIKTO_LITE_PATHS = [
@@ -112,6 +166,54 @@ NIKTO_LITE_PATHS = [
     "/cgi-bin/",
 ]
 
+FS_MAX_FILES = 20_000
+FS_MAX_READ_BYTES = 1_000_000
+FS_MAX_ASSET_ITEMS = 120
+FS_LARGE_FILE_BYTES = 50 * 1024 * 1024
+FS_SKIP_DIR_NAMES = {
+    "__pycache__",
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+}
+FS_SKIP_ABSOLUTE_PREFIXES = ("/proc", "/sys", "/dev", "/run")
+FS_TEXT_SUFFIXES = {
+    ".asp", ".asax", ".aspx", ".bash", ".bat", ".cgi", ".conf", ".config",
+    ".env", ".htaccess", ".ini", ".java", ".js", ".jsp", ".jspx", ".json",
+    ".lua", ".php", ".php3", ".php4", ".php5", ".phtml", ".pl", ".ps1",
+    ".py", ".rb", ".sh", ".sql", ".txt", ".xml", ".yaml", ".yml",
+}
+FS_WEB_EXEC_SUFFIXES = {
+    ".asp", ".aspx", ".cgi", ".jsp", ".jspx", ".php", ".php3", ".php4",
+    ".php5", ".phtml", ".phar", ".pl", ".py",
+}
+FS_UPLOAD_MARKERS = {"upload", "uploads", "tmp", "temp", "cache", "files", "media", "static"}
+FS_AUTOSTART_MARKERS = (
+    "/cron.", "/cron/", "/systemd/", "/init.d/", "/rc.local",
+    "/launchagents/", "/launchdaemons/", "/startup/", "/authorized_keys",
+)
+FS_SECRET_PATTERNS = [
+    ("Private key", re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("JWT token", re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b")),
+    ("Password/secret assignment", re.compile(r"(?i)\b(password|passwd|secret|secret[_-]?key|token|api[_-]?key|access[_-]?key)\b\s*[:=]\s*['\"][^'\"]{8,}['\"]")),
+]
+FS_WEBSHELL_PATTERNS = [
+    ("PHP eval from request", re.compile(r"(?is)\beval\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)")),
+    ("PHP command execution from request", re.compile(r"(?is)\b(?:system|shell_exec|passthru|popen|proc_open)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)")),
+    ("PHP eval/base64 obfuscation", re.compile(r"(?is)\beval\s*\(.{0,120}\bbase64_decode\s*\(")),
+    ("Known PHP shell marker", re.compile(r"(?is)\b(?:WSO|c99shell|r57shell|FilesMan|b374k)\b")),
+    ("JSP command shell", re.compile(r"(?is)Runtime\.getRuntime\(\)\.exec\s*\(.{0,120}request\.getParameter")),
+    ("ASP command shell", re.compile(r"(?is)(?:WScript\.Shell|Server\.CreateObject\(['\"]WScript\.Shell['\"]\)|Request\.(?:QueryString|Form).{0,80}(?:cmd|command))")),
+    ("Python reverse shell pattern", re.compile(r"(?is)socket\.socket\s*\(.{0,200}\.connect\s*\(.{0,200}(?:/bin/sh|cmd\.exe)")),
+]
+
 TECH_SIGNATURES = {
     "WordPress": [r"wp-content", r"wp-includes", r"generator\" content=\"WordPress"],
     "Bitrix": [r"/bitrix/", r"BITRIX_SM", r"1c-bitrix"],
@@ -124,27 +226,97 @@ TECH_SIGNATURES = {
     "jQuery": [r"jquery"],
 }
 
+RECOMMENDED_ACTIVE_TOOLS = {
+    "domain": {"nmap", "whatweb", "wfuzz", "nikto", "burp_lite", "skipfish", "legion", "theharvester", "dnsrecon", "knockpy", "altdns"},
+    "ip": {"nmap", "whatweb", "wfuzz", "nikto", "burp_lite", "skipfish", "legion"},
+    "network": {"nmap"},
+    "filesystem": set(),
+}
+
+
+def recommended_tools_for_target(target_kind: str) -> set[str]:
+    return set(RECOMMENDED_ACTIVE_TOOLS.get(target_kind, set()))
+
 
 def discover_tools(selected: set[str] | None = None) -> list[ToolStatus]:
     selected = selected or set()
     tools = [
+        ToolStatus("Инвентаризация узлов и ОС", "system-inventory", True, "встроенный Python-анализатор", "built-in", "IP/CIDR, сервисы, роли узлов, MAC/hostname и эвристика ОС."),
+        ToolStatus("Обнаружение локальной сети", "network-discovery", True, "встроенный Python-анализатор", "built-in", "Безопасный TCP-discovery подсетей до 256 адресов."),
+        ToolStatus("Аудит файловой системы", "filesystem-audit", True, "встроенный Python-анализатор", "built-in", "Проверка локального/смонтированного пути на web-shell, секреты, автозапуск и подозрительные файлы."),
+        ToolStatus("ClamAV", "clamscan", bool(find_tool_binary("clamscan")), find_tool_binary("clamscan"), "optional", "Антивирусная проверка файловой цели, если clamscan установлен."),
+        ToolStatus("YARA", "yara", bool(find_tool_binary("yara")), find_tool_binary("yara"), "optional", "Сигнатурная проверка файловой цели по локальным правилам rules/*.yar, если yara установлен."),
         _tool("nmap", "nmap", "optional", "Сетевые порты и версии сервисов. Если Nmap зависнет, включится socket fallback.", selected),
-        _tool("wapiti", "wapiti", "optional", "DAST веб-приложений; найден локальный Wapiti используется автоматически.", selected),
+        _tool(
+            "wapiti",
+            "wapiti",
+            "optional",
+            "DAST веб-приложений; Wapiti 3.3.0 устанавливается в изолированное окружение проекта.",
+            selected,
+        ),
         _tool_with_fallback("Wfuzz", "wfuzz", "Фаззинг каталогов и URL через словарь.", "встроенный Wfuzz-lite", selected),
         _tool_with_fallback("WhatWeb", "whatweb", "Фингерпринт технологий веб-сайта.", "встроенный WhatWeb-lite", selected),
         _tool_with_fallback("Nikto", "nikto", "Проверка веб-сервера на известные misconfiguration.", "встроенный Nikto-lite", selected),
         _tool("sqlmap", "sqlmap", "active", "SQL-инъекции; запускается только при активном профиле.", selected),
-        _platform_with_fallback("OpenVAS / Greenbone", "openvas", ["gvm-cli", "openvas"], "Сетевой baseline и поиск рискованных сервисов.", "встроенный OpenVAS-lite", selected),
-        _platform_with_fallback("Burp Suite", "burp", ["burpsuite"], "Пассивная карта сайта, формы и первичная web-аудитика.", "встроенный Burp-lite", selected),
+        ToolStatus("Burp-lite", "burp_lite", True, "встроенный Python-анализатор", "built-in", "Собственный модуль проекта: пассивная карта сайта, формы и CSRF-эвристики.", "burp_lite" in selected),
         _platform_with_fallback("SkipFish", "skipfish", ["skipfish"], "Активная карта сайта и web-crawl.", "встроенный SkipFish-lite", selected),
         _platform_with_fallback("Legion", "legion", ["legion"], "Оркестрация сетевых и web-проверок.", "встроенный Legion-lite", selected),
+        _tool("theHarvester", "theharvester", "passive", "Пассивный OSINT-сбор поддоменов и email из открытых источников.", selected),
+        _tool_with_fallback("DNSRecon", "dnsrecon", "Глубокий DNS-аудит, AXFR, SRV и wildcard.", "встроенный DNS-аудит", selected),
+        _tool_with_fallback("Knockpy", "knockpy", "Пассивный поиск и словарный перебор поддоменов с wildcard-контролем.", "встроенный DNS-перебор", selected),
+        _tool_with_fallback("Altdns", "altdns", "Мутации уже найденных поддоменов.", "встроенные ограниченные мутации", selected),
     ]
     return tools
 
 
+# Параллелизм движков. Встроенные проверки и внешние сканеры запускаются пулами
+# потоков; результаты (каждый самодостаточный) сливаются в общий assets в главном
+# потоке в детерминированном порядке, поэтому отчёт стабилен.
+BUILTIN_MAX_WORKERS = 6
+EXTERNAL_MAX_WORKERS = 4
+
+
+def _run_component(label: str, fn: Callable[[], dict[str, Any]], progress_id: str) -> tuple[dict[str, Any], float]:
+    """Выполнить один компонент, поймав исключение, и вернуть (результат, длительность)."""
+    step_start = time.time()
+    try:
+        result = fn()
+    except Exception as exc:
+        log_component_exception(label, exc)
+        message = f"{label}: ошибка {type(exc).__name__}: {exc}. Остальные проверки продолжены."
+        emit(progress_id, message, "warning")
+        result = {"assets": {}, "findings": [], "notes": [message]}
+    return result, time.time() - step_start
+
+
+def _run_components_parallel(
+    jobs: list[tuple[str, Callable[[], dict[str, Any]]]],
+    progress_id: str,
+    max_workers: int,
+) -> dict[str, tuple[dict[str, Any], float]]:
+    """Запустить компоненты пулом потоков; ключ результата — уникальная метка задания.
+
+    Компоненты читают только ctx и возвращают свой результат, поэтому безопасны
+    для параллельного исполнения; слияние общего состояния делает вызывающий код.
+    """
+    collected: dict[str, tuple[dict[str, Any], float]] = {}
+    if not jobs:
+        return collected
+    workers = max(1, min(max_workers, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run_component, label, fn, progress_id): label for label, fn in jobs}
+        for future in as_completed(futures):
+            label = futures[future]
+            collected[label] = future.result()
+    return collected
+
+
 def run_assessment(ctx: ScanContext, bdu: BDUHandler) -> ScanReport:
     start = time.time()
+    progress_id = ctx.progress_id or ctx.scan_id
+    emit(progress_id, "Подготавливаю контекст и структуру отчёта")
     notes: list[str] = []
+    runtime_inventory = [scanner_runtime_details(key) for key in sorted(ctx.selected_tools)]
     assets: dict[str, Any] = {
         "dns": {},
         "subdomains": [],
@@ -152,12 +324,25 @@ def run_assessment(ctx: ScanContext, bdu: BDUHandler) -> ScanReport:
         "tls": {},
         "paths": [],
         "external_reports": [],
+        "scanner_runs": [],
+        "scanner_sources": scanner_source_inventory(),
+        "scanner_runtimes": runtime_inventory,
+        "source_integration": {
+            "selected": len(runtime_inventory),
+            "source_used": sum(1 for item in runtime_inventory if item.get("source_used")),
+            "not_source_runtime": [item.get("key") for item in runtime_inventory if not item.get("source_used")],
+        },
         "scan_context": {
+            "target_kind": ctx.target_kind,
+            "network": ctx.network,
+            "filesystem_path": ctx.filesystem_path,
             "active_mode": ctx.active_mode,
             "injection_profile": ctx.injection_profile,
             "auth_cookie_provided": bool(ctx.auth_cookie),
             "auth_header_provided": bool(ctx.auth_header),
             "raw_request_provided": bool(ctx.raw_request),
+            "auto_install": ctx.auto_install,
+            "wait_for_completion": ctx.wait_for_completion,
         },
     }
     findings: list[Finding] = []
@@ -168,18 +353,41 @@ def run_assessment(ctx: ScanContext, bdu: BDUHandler) -> ScanReport:
     if ctx.raw_request:
         notes.append("SQLMap использует raw HTTP-запрос как основную цель проверки параметров.")
 
-    builtins = [
-        DNSAnalyzer(),
-        HTTPAnalyzer(),
-        TokenExposureAnalyzer(),
-        TLSAnalyzer(),
-        DirectoryProbeAnalyzer(),
-    ]
-    for analyzer in builtins:
-        result = analyzer.run(ctx)
+    if ctx.auto_install:
+        emit(progress_id, "Проверяю недостающие выбранные компоненты")
+        compatible_tools = {key for key in ctx.selected_tools if not incompatible_tool_note(key, ctx.target_kind)}
+        installed = install_missing_tools(compatible_tools, lambda message, level="info": emit(progress_id, message, level))
+        if installed:
+            notes.append("Автоустановка: добавлены компоненты " + ", ".join(installed) + ".")
+
+    if ctx.target_kind == "filesystem":
+        builtins = [FileSystemAnalyzer()]
+        notes.append("Для файловой цели выполняется локальный аудит указанного пути; web/DNS/network-проверки пропущены.")
+    elif ctx.target_kind == "network":
+        builtins = [NetworkSystemAnalyzer()]
+        notes.append("Для CIDR-цели выполняется сетевая инвентаризация; DNS- и web-проверки домена пропущены.")
+    elif ctx.target_kind == "ip":
+        builtins = [NetworkSystemAnalyzer(), HTTPAnalyzer(), TokenExposureAnalyzer(), TLSAnalyzer(), DirectoryProbeAnalyzer(), WebScenarioAnalyzer()]
+        notes.append("Для IP-цели включена инвентаризация системы; доменные DNS/OSINT-проверки пропущены.")
+    else:
+        builtins = [DNSAnalyzer(), HTTPAnalyzer(), TokenExposureAnalyzer(), TLSAnalyzer(), DirectoryProbeAnalyzer(), WebScenarioAnalyzer()]
+    builtin_jobs = [(analyzer.__class__.__name__, analyzer) for analyzer in builtins]
+    emit(progress_id, f"Параллельно выполняю встроенные проверки: {len(builtin_jobs)}")
+    builtin_results = _run_components_parallel(
+        [(label, (lambda analyzer=analyzer: analyzer.run(ctx))) for label, analyzer in builtin_jobs],
+        progress_id,
+        BUILTIN_MAX_WORKERS,
+    )
+    for label, _analyzer in builtin_jobs:
+        result, duration = builtin_results[label]
         assets.update(_deep_merge(assets, result.get("assets", {})))
         findings.extend(result.get("findings", []))
         notes.extend(result.get("notes", []))
+        assets["scanner_runs"].append(scanner_run_record(label, "built-in", result, duration))
+        emit(
+            progress_id,
+            f"{label}: готово за {duration:.1f} с, находок {len(result.get('findings', []))}",
+        )
 
     external_map = {
         "nmap": NmapAdapter(),
@@ -188,30 +396,132 @@ def run_assessment(ctx: ScanContext, bdu: BDUHandler) -> ScanReport:
         "whatweb": WhatWebAdapter(),
         "nikto": NiktoAdapter(),
         "sqlmap": SQLMapAdapter(),
-        "openvas": OpenVASAdapter(),
-        "burp": BurpAdapter(),
+        "burp_lite": BurpLiteAdapter(),
         "skipfish": SkipFishAdapter(),
         "legion": LegionAdapter(),
+        "theharvester": TheHarvesterAdapter(),
+        "dnsrecon": DNSReconAdapter(),
+        "knockpy": KnockpyAdapter(),
+        "altdns": AltdnsAdapter(),
     }
-    if ctx.active_mode:
-        for key in sorted(ctx.selected_tools):
-            adapter = external_map.get(key)
-            if not adapter:
-                continue
+    if "theharvester" in ctx.selected_tools and ctx.target_kind == "domain":
+        adapter = external_map["theharvester"]
+        emit(progress_id, f"Пассивный сканер: {adapter.label}")
+        step_start = time.time()
+        try:
             result = adapter.run(ctx)
+        except Exception as exc:
+            log_component_exception(adapter.label, exc)
+            message = f"{adapter.label}: ошибка адаптера {type(exc).__name__}: {exc}. Остальные проверки продолжены."
+            emit(progress_id, message, "warning")
+            result = {"assets": {}, "findings": [], "notes": [message]}
+        assets.update(_deep_merge(assets, result.get("assets", {})))
+        findings.extend(result.get("findings", []))
+        notes.extend(result.get("notes", []))
+        assets["scanner_runs"].append(scanner_run_record(adapter.label, "theharvester", result, time.time() - step_start))
+        emit(
+            progress_id,
+            f"{adapter.label}: готово за {time.time() - step_start:.1f} с, находок {len(result.get('findings', []))}",
+        )
+    elif "theharvester" in ctx.selected_tools:
+        compatibility_note = incompatible_tool_note("theharvester", ctx.target_kind)
+        notes.append(compatibility_note)
+        assets["scanner_runs"].append(scanner_run_record("theHarvester", "theharvester", {"status": "skipped", "notes": [compatibility_note]}, 0.0))
+    if ctx.active_mode:
+        preferred_order = [
+            "dnsrecon", "knockpy", "altdns", "nmap", "whatweb", "wfuzz", "nikto",
+            "burp_lite", "skipfish", "legion", "wapiti", "sqlmap",
+        ]
+        selected_external = [key for key in preferred_order if key in ctx.selected_tools]
+        selected_external.extend(sorted(ctx.selected_tools - set(preferred_order) - {"theharvester"}))
+        runnable: list[tuple[str, Any]] = []
+        for key in selected_external:
+            adapter = external_map.get(key)
+            compatibility_note = incompatible_tool_note(key, ctx.target_kind)
+            if compatibility_note:
+                notes.append(compatibility_note)
+                assets["scanner_runs"].append(scanner_run_record(adapter.label if adapter else key, key, {"status": "skipped", "notes": [compatibility_note]}, 0.0))
+            elif adapter:
+                runnable.append((key, adapter))
+        if runnable:
+            if ctx.wait_for_completion:
+                total_limit = int(sum(full_completion_timeout(key, EXTERNAL_TIMEOUTS.get(key, 180)) for key, _adapter in runnable))
+                emit(
+                    progress_id,
+                    f"Очередь внешних сканеров: {len(runnable)}; полный режим с предельным бюджетом {total_limit // 60} мин {total_limit % 60} с",
+                )
+            else:
+                total_limit = sum(EXTERNAL_TIMEOUTS.get(key, 180) for key, _adapter in runnable)
+                emit(
+                    progress_id,
+                    f"Очередь внешних сканеров: {len(runnable)}, оценочный бюджет по таймаутам {total_limit // 60} мин {total_limit % 60} с",
+                )
+        def merge_external(key: str, label: str, result: dict[str, Any], duration: float) -> None:
             assets.update(_deep_merge(assets, result.get("assets", {})))
             findings.extend(result.get("findings", []))
             result_notes = result.get("notes", [])
             notes.extend(result_notes)
+            assets["scanner_runs"].append(scanner_run_record(label, key, result, duration))
             if not result_notes and not result.get("findings", []):
-                notes.append(f"{adapter.label}: выполнен, новых находок не добавил.")
-    elif ctx.selected_tools:
-        notes.append("Внешние активные сканеры не запускались: включите активный профиль проверки.")
+                notes.append(f"{label}: выполнен, новых находок не добавил.")
+            emit(progress_id, f"{label}: готово за {duration:.1f} с, находок {len(result.get('findings', []))}")
 
+        # altdns зависит от собранных поддоменов, поэтому выполняется отдельной
+        # фазой после остальных внешних сканеров; всё остальное идёт параллельно.
+        parallel_runnable = [(key, adapter) for key, adapter in runnable if key != "altdns"]
+        altdns_runnable = [(key, adapter) for key, adapter in runnable if key == "altdns"]
+        if parallel_runnable:
+            workers = max(1, min(len(parallel_runnable), EXTERNAL_MAX_WORKERS))
+            emit(progress_id, f"Параллельный запуск внешних сканеров: {len(parallel_runnable)} (воркеров {workers})")
+            external_results = _run_components_parallel(
+                [(key, (lambda adapter=adapter: adapter.run(ctx))) for key, adapter in parallel_runnable],
+                progress_id,
+                EXTERNAL_MAX_WORKERS,
+            )
+            for key, adapter in parallel_runnable:
+                result, duration = external_results[key]
+                merge_external(key, adapter.label, result, duration)
+        for key, adapter in altdns_runnable:
+            emit(progress_id, f"Внешний сканер (после сбора поддоменов): {adapter.label}")
+            result, duration = _run_component(
+                adapter.label,
+                (lambda adapter=adapter: adapter.run(ctx, assets.get("subdomains", []))),
+                progress_id,
+            )
+            merge_external(key, adapter.label, result, duration)
+    elif ctx.target_kind == "filesystem" and ctx.selected_tools - {"theharvester"}:
+        for key in sorted(ctx.selected_tools - {"theharvester"}):
+            compatibility_note = incompatible_tool_note(key, ctx.target_kind)
+            if compatibility_note:
+                notes.append(compatibility_note)
+                adapter = external_map.get(key)
+                assets["scanner_runs"].append(scanner_run_record(adapter.label if adapter else key, key, {"status": "skipped", "notes": [compatibility_note]}, 0.0))
+    elif ctx.selected_tools - {"theharvester"}:
+        inactive_note = "Внешние активные сканеры не запускались: включите активный профиль проверки."
+        notes.append(inactive_note)
+        for key in sorted(ctx.selected_tools - {"theharvester"}):
+            adapter = external_map.get(key)
+            if adapter:
+                assets["scanner_runs"].append(scanner_run_record(adapter.label, key, {"status": "skipped", "notes": [inactive_note]}, 0.0))
+
+    finalize_filesystem_step(ctx, assets, findings, notes)
+    emit(progress_id, "Нормализую находки и сопоставляю их с локальной БДУ")
     findings = normalize_findings(findings)
     enriched = [bdu.enrich(item) for item in findings]
     enriched.sort(key=lambda item: (severity_rank(item.severity), item.title), reverse=True)
-    return ScanReport(
+    incomplete_runs = [
+        item for item in assets["scanner_runs"]
+        if item.get("selected") and item.get("status") not in {"completed", "completed-with-fallback"}
+    ]
+    assets["scan_completion"] = {
+        "wait_for_completion": ctx.wait_for_completion,
+        "all_selected_stages_finished": not incomplete_runs,
+        "incomplete": incomplete_runs,
+        "run_count": len(assets["scanner_runs"]),
+    }
+    if incomplete_runs:
+        notes.append("Не все выбранные движки завершились штатно: " + ", ".join(str(item["label"]) for item in incomplete_runs) + ".")
+    report = ScanReport(
         scan_id=ctx.scan_id,
         target_url=ctx.target_url,
         host=ctx.host,
@@ -223,6 +533,703 @@ def run_assessment(ctx: ScanContext, bdu: BDUHandler) -> ScanReport:
         bdu_stats=bdu.stats(),
         notes=notes,
     )
+    emit(progress_id, f"Отчёт собран: {len(enriched)} находок, длительность {time.time() - start:.1f} с")
+    assets["scan_log"] = PROGRESS.snapshot(progress_id).get("events", [])
+    return report
+
+
+class NetworkSystemAnalyzer:
+    """Small built-in inventory engine for one IP or a bounded CIDR target."""
+
+    def run(self, ctx: ScanContext) -> dict[str, Any]:
+        network_text = ctx.network or ctx.host
+        try:
+            network = ipaddress.ip_network(network_text, strict=False)
+        except ValueError:
+            return {"assets": {}, "findings": [], "notes": ["Не удалось разобрать IP-сеть для системного анализа."]}
+
+        addresses = [str(address) for address in network.hosts()]
+        if not addresses and network.num_addresses == 1:
+            addresses = [str(network.network_address)]
+        single_target = ctx.target_kind == "ip" or len(addresses) == 1
+        explicit_port = target_url_port(ctx.target_url) if ctx.target_kind == "ip" else None
+        workers = min(32, max(1, len(addresses)))
+        records: list[dict[str, Any]] = []
+        progress_id = ctx.progress_id or ctx.scan_id
+        if progress_id:
+            emit(progress_id, f"Сетевая инвентаризация: проверяю {len(addresses)} адресов, потоков {workers}")
+
+        def inspect(address: str) -> dict[str, Any] | None:
+            initial_ports = list(COMMON_TCP_PORTS) if single_target else list(DISCOVERY_TCP_PORTS)
+            if explicit_port and explicit_port not in initial_ports:
+                initial_ports.append(explicit_port)
+            open_ports = scan_host_ports(address, initial_ports, timeout=0.22 if not single_target else 0.45)
+            if explicit_port:
+                for item in open_ports:
+                    if item.get("port") == explicit_port and item.get("service") == "unknown":
+                        item["service"] = "https-target" if ctx.target_url.startswith("https://") else "http-target"
+            if single_target:
+                already_checked = set(initial_ports)
+                if progress_id:
+                    emit(progress_id, f"Порт-скан {address}: ищу открытые TCP-порты 1-65535")
+                open_ports.extend(
+                    discover_tcp_ports(
+                        address,
+                        exclude=already_checked,
+                        timeout=FULL_TCP_SCAN_TIMEOUT,
+                        workers=FULL_TCP_SCAN_WORKERS,
+                    )
+                )
+                open_ports = dedupe_port_records(open_ports)
+                if progress_id:
+                    emit(progress_id, f"Порт-скан {address}: найдено открытых TCP-портов {len(open_ports)}")
+            if not open_ports and not single_target:
+                return None
+            if open_ports and not single_target:
+                already_checked = {int(item["port"]) for item in open_ports}
+                remaining = [port for port in COMMON_TCP_PORTS if port not in already_checked]
+                open_ports.extend(scan_host_ports(address, remaining, timeout=0.28))
+                open_ports.sort(key=lambda item: int(item["port"]))
+            hostname = reverse_hostname(address) if open_ports else ""
+            os_guess, roles, confidence = infer_system_profile(open_ports)
+            legion_profile = legion_device_profile(open_ports, hostname=hostname, os_match=os_guess)
+            mac = local_arp_entry(address) if open_ports else {}
+            return {
+                "ip": address,
+                "status": "online" if open_ports else "no_response",
+                "hostname": hostname,
+                "mac": mac.get("mac", ""),
+                "interface": mac.get("interface", ""),
+                "os_guess": os_guess,
+                "os_confidence": confidence,
+                "roles": roles,
+                "device_categories": legion_profile.get("device_categories", []),
+                "legion_classification": legion_profile.get("classification", []),
+                "open_ports": open_ports,
+            }
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(inspect, address): address for address in addresses}
+            progress_step = max(1, len(futures) // 4)
+            for completed, future in enumerate(as_completed(futures), 1):
+                try:
+                    record = future.result()
+                except Exception:
+                    record = None
+                if record:
+                    records.append(record)
+                    if progress_id and record.get("status") == "online":
+                        emit(progress_id, f"Найден узел {record['ip']}: открытых TCP-портов {len(record['open_ports'])}")
+                if progress_id and completed % progress_step == 0 and len(futures) > 1:
+                    emit(progress_id, f"Сетевая инвентаризация: обработано {completed}/{len(futures)} адресов")
+        records.sort(key=lambda item: ipaddress.ip_address(item["ip"]))
+
+        findings: list[Finding] = []
+        for record in records:
+            findings.extend(system_exposure_findings(record))
+        responsive = sum(1 for item in records if item["status"] == "online")
+        summary = {
+            "network": network.with_prefixlen,
+            "address_count": len(addresses),
+            "responsive_hosts": responsive,
+            "discovery_method": "TCP connect",
+            "discovery_ports": "1-65535" if single_target else list(DISCOVERY_TCP_PORTS),
+            "port_scan_mode": "full_tcp_single_host" if single_target else "cidr_discovery_then_common_ports",
+            "limit": 256,
+        }
+        notes = []
+        if ctx.target_kind == "network":
+            notes.append(
+                "Встроенный discovery считает узел доступным при ответе на один из контрольных TCP-портов; "
+                "узлы с полностью фильтруемыми портами может дополнительно обнаружить Nmap."
+            )
+        return {
+            "assets": {"network_inventory": summary, "systems": records},
+            "findings": findings,
+            "notes": notes,
+        }
+
+
+class FileSystemAnalyzer:
+    """Read-only audit for a local or mounted server filesystem path."""
+
+    def run(self, ctx: ScanContext) -> dict[str, Any]:
+        root_text = ctx.filesystem_path or ctx.network or ctx.original_target
+        root = Path(root_text).expanduser()
+        progress_id = ctx.progress_id or ctx.scan_id
+        assets: dict[str, Any] = {
+            "filesystem": {
+                "root": str(root),
+                "mode": "read-only",
+                "limits": {
+                    "max_files": FS_MAX_FILES,
+                    "max_read_bytes_per_file": FS_MAX_READ_BYTES,
+                    "max_asset_items_per_section": FS_MAX_ASSET_ITEMS,
+                },
+                "statistics": {
+                    "files_seen": 0,
+                    "files_analyzed": 0,
+                    "directories_seen": 0,
+                    "bytes_seen": 0,
+                    "unreadable_files": 0,
+                    "skipped_directories": 0,
+                    "large_files": 0,
+                },
+                "webshell_candidates": [],
+                "secret_candidates": [],
+                "suspicious_files": [],
+                "autostart_files": [],
+                "executable_candidates": [],
+                "tool_checks": {},
+            }
+        }
+        notes: list[str] = []
+        findings: list[Finding] = []
+        fs = assets["filesystem"]
+        stats = fs["statistics"]
+
+        if not root.exists():
+            return {
+                "assets": assets,
+                "findings": [
+                    Finding(
+                        "Файловый путь недоступен",
+                        "Средний",
+                        "Filesystem audit",
+                        "Built-in filesystem",
+                        "Указанный путь не существует или не смонтирован на машине, где запущен анализатор.",
+                        evidence=str(root),
+                        remediation="Смонтируйте каталог сервера по SSHFS/NFS/SMB или укажите корректный локальный путь.",
+                        cwe=["CWE-668"],
+                    )
+                ],
+                "notes": ["Файловый аудит не выполнен: путь не найден."],
+            }
+
+        if progress_id:
+            emit(progress_id, f"Файловый аудит: обхожу {root}")
+
+        for path in iter_filesystem_targets(root, stats):
+            if stats["files_seen"] >= FS_MAX_FILES:
+                notes.append(f"Файловый аудит остановлен на лимите {FS_MAX_FILES} файлов; укажите более узкий каталог для полной проверки.")
+                break
+            stats["files_seen"] += 1
+            try:
+                stat_result = path.lstat()
+            except OSError:
+                stats["unreadable_files"] += 1
+                continue
+            if not path.is_file():
+                continue
+            size = int(stat_result.st_size)
+            stats["bytes_seen"] += size
+            if size > FS_LARGE_FILE_BYTES:
+                stats["large_files"] += 1
+            record = filesystem_file_record(path, root, stat_result)
+            stats["files_analyzed"] += 1
+
+            reasons = suspicious_filename_reasons(path, root)
+            if reasons:
+                append_limited(fs["suspicious_files"], {**record, "reasons": reasons})
+
+            if is_autostart_artifact(path, root):
+                append_limited(fs["autostart_files"], {**record, "reason": "autostart/persistence location"})
+
+            if is_executable_candidate(path, root, stat_result):
+                append_limited(fs["executable_candidates"], {**record, "reason": "executable in upload/tmp/web content location"})
+
+            if size <= FS_MAX_READ_BYTES and looks_textual(path):
+                text = read_text_sample(path)
+                if text:
+                    webshell_matches = pattern_matches(text, FS_WEBSHELL_PATTERNS)
+                    if webshell_matches:
+                        append_limited(
+                            fs["webshell_candidates"],
+                            {**record, "matches": webshell_matches, "sha256": sha256_file(path)},
+                        )
+                    secret_matches = pattern_matches(text, FS_SECRET_PATTERNS)
+                    if secret_matches:
+                        append_limited(fs["secret_candidates"], {**record, "matches": secret_matches})
+                    obfuscation = obfuscation_reasons(text, path)
+                    if obfuscation:
+                        append_limited(
+                            fs["suspicious_files"],
+                            {**record, "reasons": obfuscation, "sha256": sha256_file(path)},
+                        )
+            elif size > FS_MAX_READ_BYTES:
+                reasons = suspicious_binary_reasons(path, root, stat_result)
+                if reasons:
+                    append_limited(
+                        fs["suspicious_files"],
+                        {**record, "reasons": reasons, "sha256": sha256_file(path)},
+                    )
+
+            if progress_id and stats["files_seen"] in {1000, 5000, 10000, 15000}:
+                emit(progress_id, f"Файловый аудит: просмотрено {stats['files_seen']} файлов")
+
+        findings.extend(filesystem_findings(fs))
+        findings.extend(run_clamav_if_available(ctx, root, fs, notes))
+        findings.extend(run_yara_if_available(ctx, root, fs, notes))
+        notes.extend(filesystem_notes(fs))
+        return {"assets": assets, "findings": findings, "notes": notes}
+
+
+def iter_filesystem_targets(root: Path, stats: dict[str, Any]):
+    if root.is_file():
+        yield root
+        return
+
+    def onerror(_error: OSError) -> None:
+        stats["skipped_directories"] += 1
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=onerror, followlinks=False):
+        current = Path(dirpath)
+        stats["directories_seen"] += 1
+        kept: list[str] = []
+        for dirname in dirnames:
+            child = current / dirname
+            if should_skip_filesystem_dir(child):
+                stats["skipped_directories"] += 1
+            else:
+                kept.append(dirname)
+        dirnames[:] = kept
+        for filename in filenames:
+            yield current / filename
+
+
+def should_skip_filesystem_dir(path: Path) -> bool:
+    name = path.name.lower()
+    if name in FS_SKIP_DIR_NAMES:
+        return True
+    if name == "objects" and path.parent.name == ".git":
+        return True
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return True
+    full = str(path)
+    return any(full == prefix or full.startswith(prefix + os.sep) for prefix in FS_SKIP_ABSOLUTE_PREFIXES)
+
+
+def filesystem_file_record(path: Path, root: Path, stat_result: os.stat_result) -> dict[str, Any]:
+    try:
+        relative = str(path.relative_to(root))
+    except ValueError:
+        relative = str(path)
+    return {
+        "path": str(path),
+        "relative_path": relative,
+        "size": int(stat_result.st_size),
+        "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat_result.st_mtime)),
+        "mode": oct(stat_result.st_mode & 0o777),
+    }
+
+
+def append_limited(items: list[dict[str, Any]], item: dict[str, Any]) -> None:
+    if len(items) < FS_MAX_ASSET_ITEMS:
+        items.append(item)
+
+
+def relative_path_text(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root)).replace(os.sep, "/").lower()
+    except ValueError:
+        return str(path).replace(os.sep, "/").lower()
+
+
+def path_parts_lower(path: Path, root: Path) -> set[str]:
+    rel = relative_path_text(path, root)
+    return {part for part in rel.split("/") if part}
+
+
+def is_upload_location(path: Path, root: Path) -> bool:
+    return bool(path_parts_lower(path, root) & FS_UPLOAD_MARKERS)
+
+
+def suspicious_filename_reasons(path: Path, root: Path) -> list[str]:
+    lower_name = path.name.lower()
+    suffix = path.suffix.lower()
+    reasons: list[str] = []
+    if has_embedded_web_exec_extension(path):
+        reasons.append("double extension that can mask executable web code")
+    if suffix in {".phtml", ".phar", ".jspx", ".asax"}:
+        reasons.append("rare executable web extension")
+    if is_upload_location(path, root) and suffix in FS_WEB_EXEC_SUFFIXES:
+        reasons.append("web-executable extension inside upload/tmp/media path")
+    if lower_name.endswith(("~", ".bak", ".old", ".save", ".orig")) and re.search(r"(?i)(config|settings|secret|password|backup|dump|db)", lower_name):
+        reasons.append("backup copy of sensitive-looking configuration/data file")
+    return reasons
+
+
+def is_autostart_artifact(path: Path, root: Path) -> bool:
+    rel = "/" + relative_path_text(path, root)
+    name = path.name.lower()
+    return (
+        any(marker in rel for marker in FS_AUTOSTART_MARKERS)
+        or name in {"crontab", "rc.local", "authorized_keys", ".bashrc", ".zshrc", ".profile"}
+        or name.endswith((".service", ".timer", ".plist"))
+    )
+
+
+def is_executable_candidate(path: Path, root: Path, stat_result: os.stat_result) -> bool:
+    executable_bit = bool(stat_result.st_mode & 0o111)
+    suffix = path.suffix.lower()
+    return is_upload_location(path, root) and (executable_bit or suffix in FS_WEB_EXEC_SUFFIXES or has_embedded_web_exec_extension(path))
+
+
+def looks_textual(path: Path) -> bool:
+    lower_name = path.name.lower()
+    suffix = path.suffix.lower()
+    if suffix in FS_TEXT_SUFFIXES:
+        return True
+    if has_embedded_web_exec_extension(path):
+        return True
+    return (
+        lower_name.startswith(".env")
+        or lower_name in {"authorized_keys", "id_rsa", "id_ed25519", "credentials", "settings", "config"}
+        or lower_name.endswith((".service", ".timer", ".plist", ".conf", ".config", ".ini"))
+    )
+
+
+def has_embedded_web_exec_extension(path: Path) -> bool:
+    return bool(re.search(r"\.(?:php|phtml|phar|jsp|jspx|asp|aspx)\.(?:jpg|jpeg|png|gif|txt|bak|old|zip)$", path.name.lower()))
+
+
+def read_text_sample(path: Path) -> str:
+    try:
+        data = path.read_bytes()[:FS_MAX_READ_BYTES]
+    except OSError:
+        return ""
+    if b"\x00" in data[:4096]:
+        return ""
+    return data.decode("utf-8", errors="ignore")
+
+
+def pattern_matches(text: str, patterns: list[tuple[str, re.Pattern[str]]]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    for label, pattern in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        line_numbers = [index for index, line in enumerate(lines, 1) if pattern.search(line)][:5]
+        if not line_numbers:
+            line_numbers = [text[: match.start()].count("\n") + 1]
+        matches.append({"pattern": label, "lines": line_numbers})
+        if len(matches) >= 12:
+            break
+    return matches
+
+
+def obfuscation_reasons(text: str, path: Path) -> list[str]:
+    suffix = path.suffix.lower()
+    reasons: list[str] = []
+    if suffix in FS_WEB_EXEC_SUFFIXES and re.search(r"[A-Za-z0-9+/]{220,}={0,2}", text):
+        reasons.append("long base64-like blob in executable web file")
+    if suffix in {".php", ".phtml", ".phar"} and re.search(r"(?is)(gzinflate|str_rot13|base64_decode).{0,160}(eval|assert)\s*\(", text):
+        reasons.append("PHP obfuscation chain with dynamic execution")
+    if suffix == ".js" and re.search(r"(?is)(eval\s*\(\s*atob|new Function\s*\()", text):
+        reasons.append("JavaScript dynamic execution/obfuscation")
+    return reasons
+
+
+def suspicious_binary_reasons(path: Path, root: Path, stat_result: os.stat_result) -> list[str]:
+    if is_executable_candidate(path, root, stat_result):
+        return ["large executable or web-executable file in upload/tmp/media path"]
+    return []
+
+
+def sha256_file(path: Path, max_bytes: int = FS_LARGE_FILE_BYTES) -> str:
+    try:
+        if path.stat().st_size > max_bytes:
+            return ""
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def filesystem_findings(fs: dict[str, Any]) -> list[Finding]:
+    findings: list[Finding] = []
+    webshells = fs.get("webshell_candidates", [])
+    secrets = fs.get("secret_candidates", [])
+    suspicious = fs.get("suspicious_files", [])
+    autostart = fs.get("autostart_files", [])
+    executables = fs.get("executable_candidates", [])
+    if webshells:
+        findings.append(
+            Finding(
+                "Обнаружены признаки web-shell/backdoor в файлах",
+                "Критический",
+                "Malware / Web shell",
+                "Built-in filesystem",
+                "В файловой системе найдены файлы с паттернами удалённого выполнения кода, web-shell или обфускации. Это требует ручной верификации и срочного реагирования.",
+                evidence=json.dumps(webshells[:8], ensure_ascii=False),
+                remediation="Изолируйте копию файлов, проверьте журнал доступа, восстановите файлы из доверенного источника, смените секреты и закройте исходный вектор загрузки/выполнения.",
+                cwe=["CWE-94", "CWE-78", "CWE-434"],
+                confidence="Высокая",
+            )
+        )
+    if secrets:
+        findings.append(
+            Finding(
+                "Найдены потенциальные секреты в файлах",
+                "Высокий",
+                "Secrets exposure",
+                "Built-in filesystem",
+                "Файлы похожи на содержащие приватные ключи, токены или пароли. Значения секретов в отчёт намеренно не выводятся.",
+                evidence=json.dumps(secrets[:10], ensure_ascii=False),
+                remediation="Проверьте указанные файлы, уберите секреты из web-root/репозитория, ротируйте ключи и настройте secret scanning в CI.",
+                cwe=["CWE-200", "CWE-522", "CWE-798"],
+                confidence="Средняя",
+            )
+        )
+    if executables:
+        findings.append(
+            Finding(
+                "Исполняемые файлы или web-скрипты находятся в upload/tmp-зоне",
+                "Высокий",
+                "Unsafe file upload",
+                "Built-in filesystem",
+                "В каталогах загрузок, временных файлов или media найдены исполняемые файлы/web-скрипты. Это типичный признак риска RCE через загрузку файла.",
+                evidence=json.dumps(executables[:10], ensure_ascii=False),
+                remediation="Запретите выполнение скриптов в upload/tmp/media, храните загрузки вне web-root, проверяйте MIME/расширения и используйте случайные имена.",
+                cwe=["CWE-434"],
+                confidence="Средняя",
+            )
+        )
+    if suspicious:
+        findings.append(
+            Finding(
+                "Найдены подозрительные имена, расширения или обфускация файлов",
+                "Средний",
+                "Suspicious files",
+                "Built-in filesystem",
+                "Часть файлов похожа на замаскированные скрипты, резервные копии чувствительных файлов или обфусцированный код.",
+                evidence=json.dumps(suspicious[:12], ensure_ascii=False),
+                remediation="Проверьте происхождение файлов, сравните с эталонной поставкой приложения и удаляйте только после подтверждения владельцем системы.",
+                cwe=["CWE-200", "CWE-434"],
+                confidence="Низкая",
+            )
+        )
+    if autostart:
+        findings.append(
+            Finding(
+                "Найдены файлы автозапуска или persistence-точки",
+                "Средний",
+                "Persistence",
+                "Built-in filesystem",
+                "Обнаружены cron/systemd/LaunchAgent/authorized_keys или похожие точки закрепления. Это не всегда вредоносно, но требует контроля.",
+                evidence=json.dumps(autostart[:12], ensure_ascii=False),
+                remediation="Сверьте задания автозапуска и SSH-ключи с утверждённой конфигурацией, удалите неизвестные записи и проверьте историю изменений.",
+                cwe=["CWE-284"],
+                confidence="Низкая",
+            )
+        )
+    return findings
+
+
+def filesystem_notes(fs: dict[str, Any]) -> list[str]:
+    stats = fs.get("statistics", {})
+    notes = ["Файловый аудит выполнен в read-only режиме: файлы не удалялись, не лечились и не помещались в карантин."]
+    if stats.get("skipped_directories"):
+        notes.append(f"Файловый аудит пропустил служебные/тяжёлые каталоги: {stats['skipped_directories']}.")
+    if stats.get("unreadable_files"):
+        notes.append(f"Часть файлов недоступна для чтения текущему пользователю: {stats['unreadable_files']}.")
+    return notes
+
+
+def run_clamav_if_available(ctx: ScanContext, root: Path, fs: dict[str, Any], notes: list[str]) -> list[Finding]:
+    path = find_tool_binary("clamscan")
+    check: dict[str, Any] = {"available": bool(path), "path": path or "", "status": "not_available"}
+    fs.setdefault("tool_checks", {})["clamscan"] = check
+    if not path:
+        notes.append("ClamAV не найден: антивирусный слой пропущен, встроенные сигнатуры уже применены.")
+        return []
+    progress_id = ctx.progress_id or ctx.scan_id
+    if progress_id:
+        emit(progress_id, "ClamAV: проверяю файловую цель")
+    timeout = full_completion_timeout("clamscan", 300) if ctx.wait_for_completion else 300
+    result = run_command(
+        [path, "-r", "--infected", "--no-summary", "--max-filesize=25M", "--max-scansize=200M", str(root)],
+        timeout=timeout,
+        progress=(lambda message: emit(progress_id, f"ClamAV: {message}")) if progress_id else None,
+    )
+    stdout = result.get("stdout", "")
+    infected = [line.strip() for line in stdout.splitlines() if " FOUND" in line]
+    check.update(
+        {
+            "status": "timeout" if result.get("timed_out") else "completed",
+            "returncode": result.get("returncode"),
+            "timed_out": bool(result.get("timed_out")),
+            "infected_count": len(infected),
+            "infected": infected[:50],
+            "stderr_tail": result.get("stderr", "")[-1200:],
+        }
+    )
+    if result.get("timed_out"):
+        notes.append("ClamAV остановлен предохранителем; используйте более узкий каталог или запустите clamscan отдельно.")
+    if infected:
+        return [
+            Finding(
+                "ClamAV обнаружил вредоносные файлы",
+                "Критический",
+                "Malware",
+                "ClamAV",
+                "Антивирусный движок сообщил совпадения по известным сигнатурам вредоносного ПО.",
+                evidence=json.dumps(infected[:20], ensure_ascii=False),
+                remediation="Изолируйте систему/копию файлов, подтвердите срабатывания, восстановите из доверенного бэкапа и выполните расследование точки входа.",
+                cwe=["CWE-506"],
+                confidence="Высокая",
+            )
+        ]
+    if result.get("returncode") not in {0, 1, 124}:
+        notes.append(f"ClamAV завершился с кодом {result.get('returncode')}: {result.get('stderr', '')[-300:]}")
+    return []
+
+
+def run_yara_if_available(ctx: ScanContext, root: Path, fs: dict[str, Any], notes: list[str]) -> list[Finding]:
+    yara = find_tool_binary("yara")
+    rule_files = sorted(RULES_DIR.glob("*.yar")) + sorted(RULES_DIR.glob("*.yara")) if RULES_DIR.exists() else []
+    check: dict[str, Any] = {
+        "available": bool(yara),
+        "path": yara or "",
+        "rules": [str(path) for path in rule_files],
+        "status": "not_available" if not yara else "no_rules",
+    }
+    fs.setdefault("tool_checks", {})["yara"] = check
+    if not yara:
+        notes.append("YARA не найдена: сигнатурный слой YARA пропущен.")
+        return []
+    if not rule_files:
+        notes.append("YARA найдена, но локальные правила rules/*.yar отсутствуют.")
+        return []
+    progress_id = ctx.progress_id or ctx.scan_id
+    if progress_id:
+        emit(progress_id, "YARA: проверяю файловую цель по локальным правилам")
+    timeout = full_completion_timeout("yara", 240) if ctx.wait_for_completion else 240
+    result = run_command(
+        [yara, "-r", str(rule_files[0]), str(root)],
+        timeout=timeout,
+        progress=(lambda message: emit(progress_id, f"YARA: {message}")) if progress_id else None,
+    )
+    matches = [line.strip() for line in result.get("stdout", "").splitlines() if line.strip()]
+    check.update(
+        {
+            "status": "timeout" if result.get("timed_out") else "completed",
+            "returncode": result.get("returncode"),
+            "timed_out": bool(result.get("timed_out")),
+            "match_count": len(matches),
+            "matches": matches[:80],
+            "stderr_tail": result.get("stderr", "")[-1200:],
+        }
+    )
+    if result.get("timed_out"):
+        notes.append("YARA остановлена предохранителем; используйте более узкий каталог или запустите yara отдельно.")
+    if matches:
+        return [
+            Finding(
+                "YARA обнаружила подозрительные файлы",
+                "Высокий",
+                "Malware / Suspicious code",
+                "YARA",
+                "Локальные YARA-правила нашли совпадения с web-shell, обфускацией или подозрительным кодом.",
+                evidence=json.dumps(matches[:30], ensure_ascii=False),
+                remediation="Проверьте совпавшие файлы вручную, сопоставьте с журналами доступа и восстановите изменённые компоненты из доверенного источника.",
+                cwe=["CWE-94", "CWE-506"],
+                confidence="Средняя",
+            )
+        ]
+    if result.get("returncode") not in {0, 1, 124}:
+        notes.append(f"YARA завершилась с кодом {result.get('returncode')}: {result.get('stderr', '')[-300:]}")
+    return []
+
+
+def finalize_filesystem_step(ctx: ScanContext, assets: dict[str, Any], findings: list[Finding], notes: list[str]) -> None:
+    if ctx.target_kind == "filesystem":
+        return
+    if assets.get("filesystem"):
+        return
+
+    file_services = collect_file_service_ports(assets)
+    if file_services:
+        reason = (
+            "Файловая система сервера не смонтирована в анализаторе, поэтому содержимое файлов не читалось. "
+            "При этом найдены сетевые файловые сервисы — проверьте, должны ли они быть доступны."
+        )
+        status = "skipped-file-services-detected"
+        findings.append(
+            Finding(
+                "Доступны сетевые файловые сервисы",
+                "Средний",
+                "File service exposure",
+                "Built-in filesystem gate",
+                "Сканирование портов обнаружило сервисы, через которые потенциально может быть доступна файловая система или передача файлов. Содержимое не проверялось без смонтированного/разрешённого доступа.",
+                evidence=json.dumps(file_services[:20], ensure_ascii=False),
+                remediation="Если сервис нужен — ограничьте доступ VPN/ACL, проверьте аутентификацию и права шар. Для анализа содержимого смонтируйте разрешённый каталог и запустите проверку повторно.",
+                cwe=["CWE-284", "CWE-200"],
+                confidence="Средняя",
+            )
+        )
+    else:
+        reason = (
+            "Файловая система цели не открыта как локальный/смонтированный путь и явные сетевые файловые сервисы не найдены; "
+            "файловый аудит безопасно пропущен."
+        )
+        status = "skipped-not-accessible"
+
+    assets["filesystem"] = {
+        "status": status,
+        "checked": False,
+        "mode": "not-mounted",
+        "reason": reason,
+        "file_service_ports": file_services,
+        "how_to_enable": "Если есть права на сервер, смонтируйте нужный каталог через SSHFS/SMB/NFS и укажите его как file:///путь.",
+    }
+    notes.append(reason)
+    progress_id = ctx.progress_id or ctx.scan_id
+    if progress_id:
+        emit(progress_id, f"Файловый аудит: {reason}", "warning")
+
+
+def collect_file_service_ports(assets: dict[str, Any]) -> list[dict[str, Any]]:
+    observed: dict[tuple[str, int, str], dict[str, Any]] = {}
+
+    def add_port(item: dict[str, Any], default_host: str = "") -> None:
+        try:
+            port = int(item.get("port", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        service_text = " ".join(str(item.get(key, "")) for key in ("service", "product", "version")).lower()
+        if port not in FILE_SERVICE_PORTS and not any(token in service_text for token in ["ftp", "smb", "netbios", "nfs", "rsync", "sftp"]):
+            return
+        host = str(item.get("host") or item.get("ip") or default_host or "")
+        protocol = str(item.get("protocol") or "tcp")
+        record = {
+            "host": host,
+            "port": port,
+            "protocol": protocol,
+            "service": item.get("service") or FILE_SERVICE_PORTS.get(port, "file-service"),
+            "product": item.get("product", ""),
+            "version": item.get("version", ""),
+        }
+        observed[(host, port, protocol)] = record
+
+    for system in assets.get("systems", []):
+        host = str(system.get("ip", ""))
+        for port_item in system.get("open_ports", []):
+            add_port(port_item, host)
+
+    for section in ("nmap", "nmap_fallback"):
+        data = assets.get(section, {})
+        for port_item in data.get("ports", []) if isinstance(data, dict) else []:
+            add_port(port_item)
+
+    return sorted(observed.values(), key=lambda item: (item.get("host", ""), int(item.get("port", 0))))
 
 
 class DNSAnalyzer:
@@ -232,10 +1239,52 @@ class DNSAnalyzer:
             "AAAA": dig_records(ctx.host, "AAAA"),
             "MX": dig_records(ctx.host, "MX"),
             "NS": dig_records(ctx.host, "NS"),
+            "SOA": dig_records(ctx.host, "SOA"),
+            "CAA": dig_records(ctx.host, "CAA"),
             "TXT": dig_records(ctx.host, "TXT"),
             "DMARC": dig_records(f"_dmarc.{ctx.host}", "TXT"),
+            "DNSKEY": dig_records(ctx.host, "DNSKEY"),
         }
         findings: list[Finding] = []
+
+        srv_names = [
+            "_ldap._tcp",
+            "_kerberos._tcp",
+            "_sip._tcp",
+            "_sip._udp",
+            "_sips._tcp",
+            "_xmpp-server._tcp",
+            "_autodiscover._tcp",
+        ]
+        srv_records = {
+            prefix: values
+            for prefix in srv_names
+            if (values := dig_records(f"{prefix}.{ctx.host}", "SRV"))
+        }
+        wildcard_host = f"bdu-wildcard-{uuid.uuid4().hex[:12]}.{ctx.host}"
+        wildcard = {
+            "test_host": wildcard_host,
+            "A": dig_records(wildcard_host, "A"),
+            "AAAA": dig_records(wildcard_host, "AAAA"),
+            "CNAME": dig_records(wildcard_host, "CNAME"),
+        }
+        wildcard["detected"] = bool(wildcard["A"] or wildcard["AAAA"] or wildcard["CNAME"])
+        zone_transfers = check_zone_transfers(ctx.host, records["NS"])
+        if any(item.get("allowed") for item in zone_transfers):
+            exposed = [item.get("nameserver", "") for item in zone_transfers if item.get("allowed")]
+            findings.append(
+                Finding(
+                    "DNS-зона допускает полный перенос AXFR",
+                    "Высокий",
+                    "DNS zone transfer",
+                    "Built-in DNS",
+                    "Авторитетный DNS-сервер вернул содержимое зоны на AXFR-запрос. Это раскрывает внутренние имена и структуру инфраструктуры.",
+                    evidence=", ".join(exposed),
+                    remediation="Запретите AXFR для произвольных клиентов и разрешите перенос зоны только доверенным secondary DNS по ACL/TSIG.",
+                    cwe=["CWE-200"],
+                    confidence="Высокая",
+                )
+            )
 
         if not records["A"] and not records["AAAA"]:
             findings.append(
@@ -280,11 +1329,13 @@ class DNSAnalyzer:
             )
 
         subdomains = []
+        wildcard_values = set(wildcard["A"] + wildcard["AAAA"] + wildcard["CNAME"])
         for label in COMMON_SUBDOMAINS:
             name = f"{label}.{ctx.host}"
             a = dig_records(name, "A")
             cname = dig_records(name, "CNAME")
-            if a or cname:
+            values = set(a + cname)
+            if values and (not wildcard["detected"] or values != wildcard_values):
                 subdomains.append({"host": name, "a": a, "cname": cname})
                 if label in {"admin", "dev", "test", "stage", "staging"}:
                     findings.append(
@@ -300,7 +1351,16 @@ class DNSAnalyzer:
                         )
                     )
 
-        return {"assets": {"dns": records, "subdomains": subdomains}, "findings": findings, "notes": []}
+        records["SRV"] = srv_records
+        records["DNSSEC"] = {"enabled": bool(records["DNSKEY"]), "dnskey_count": len(records["DNSKEY"])}
+        records["wildcard"] = wildcard
+        records["zone_transfers"] = zone_transfers
+        notes = []
+        if wildcard["detected"]:
+            notes.append("Built-in DNS обнаружил wildcard-запись; совпадающие ответы исключены из списка поддоменов.")
+        if not shutil.which("dig"):
+            notes.append("Утилита dig не найдена: расширенные NS/MX/SRV/DNSSEC/AXFR-проверки ограничены.")
+        return {"assets": {"dns": records, "subdomains": subdomains}, "findings": findings, "notes": notes}
 
 
 class HTTPAnalyzer:
@@ -722,46 +1782,821 @@ class DirectoryProbeAnalyzer:
         return {"assets": {"paths": paths}, "findings": findings, "notes": []}
 
 
+# Бюджеты прикладного анализатора: держат проверку быстрой и вежливой даже на
+# большом приложении. Активные пробы шлются только в активном режиме.
+WEB_SCENARIO_MAX_PAGES = 40
+WEB_SCENARIO_MAX_POINTS = 30
+WEB_SCENARIO_MAX_PARAMS = 5
+WEB_SCENARIO_REQUEST_BUDGET = 600
+
+SECRET_RESPONSE_PATTERNS = [
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("Stripe-подобный live-секрет", re.compile(r"\bsk_live_[0-9A-Za-z]{6,}")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}")),
+    ("Приватный ключ", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    ("Секрет в JSON-поле", re.compile(r"\"(?:api[_-]?key|secret|access[_-]?token|client[_-]?secret|password)\"\s*:\s*\"[^\"]{6,}\"", re.I)),
+]
+
+PASSWD_RE = re.compile(r"root:.*?:0:0:", re.S)
+UID_RE = re.compile(r"uid=\d+\(")
+
+# Статические ресурсы не являются страницами приложения: их исходник (особенно
+# JS фронтенда) может содержать строки `<form>` и литералы маркеров, что давало
+# бы ложные срабатывания. Такие ссылки не краулятся и не парсятся как формы.
+STATIC_ASSET_EXT = (
+    ".js", ".mjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+    ".ico", ".webp", ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".zip",
+    ".gz", ".mp4", ".webm", ".mp3", ".wasm",
+)
+
+DEBUG_TRACEBACK_MARKERS = ("Werkzeug Debugger", "Traceback (most recent call last)", "class=\"traceback\"")
+
+
+def is_static_asset(url: str) -> bool:
+    return urlparse(url).path.lower().rsplit("?", 1)[0].endswith(STATIC_ASSET_EXT)
+
+
+_ROUTE_ID_SEGMENT = re.compile(r"^(\d+|[A-Za-z]+[-_]?\d+)$")
+
+
+def route_template(action: str) -> str:
+    """Свернуть идентификаторы в пути к шаблону маршрута.
+
+    /product/chair-01/review и /product/lamp-02/review -> /product/{id}/review,
+    чтобы один маршрут не порождал дубли находок и лишние пробы.
+    """
+    parsed = urlparse(action)
+    segments = ["{id}" if _ROUTE_ID_SEGMENT.match(seg) else seg for seg in parsed.path.split("/")]
+    return f"{parsed.scheme}://{parsed.netloc}{'/'.join(segments)}"
+
+
+def mask_secret(value: str) -> str:
+    value = (value or "").strip()
+    if len(value) <= 8:
+        return (value[:2] + "***") if value else "***"
+    return value[:4] + "***" + value[-2:]
+
+
+class WebScenarioAnalyzer:
+    """Безопасные прикладные проверки веб-приложения.
+
+    Краулит страницы того же origin, собирает формы и GET-точки с параметрами и
+    проверяет их по классам уязвимостей. Детект — по маркерам в ответе приложения
+    и по наблюдаемому поведению, без реальной эксплуатации. Пассивные проверки
+    (CORS, доверие к X-Forwarded-For, раскрытие debug/секретов) безопасны и
+    выполняются всегда; пробы атакующей формы (SQLi/XSS/инъекции/IDOR/оплата/
+    перебор входа) — только в активном режиме.
+    """
+
+    label = "Прикладные проверки веб-приложения"
+
+    # (заголовок находки, список CWE, полезная нагрузка, детектор по телу ответа)
+    MARKER_PROBES: list[tuple[str, list[str], str, Callable[[str], bool]]] = [
+        ("Внедрение команд ОС (OS command injection)", ["CWE-78"], "127.0.0.1;id",
+         lambda body: "INJECTION_MARKER" in body or bool(UID_RE.search(body))),
+        ("Server-Side Template Injection (SSTI)", ["CWE-1336", "CWE-94"], "{{7*7}}",
+         lambda body: "SSTI_MARKER" in body or ("{{7*7}}" not in body and re.search(r"(^|[^0-9])49([^0-9]|$)", body) is not None and "TEMPLATE_MARKER" in body)),
+        ("Обработка внешних сущностей XML (XXE)", ["CWE-611"], "<!DOCTYPE bdu [<!ENTITY x \"bdu\">]><root>&x;</root>",
+         lambda body: "XXE_MARKER" in body),
+        ("Небезопасная десериализация", ["CWE-502"], "bdu-deserialize-probe",
+         lambda body: "SERIALIZATION_MARKER" in body),
+    ]
+
+    def run(self, ctx: ScanContext) -> dict[str, Any]:
+        self.ctx = ctx
+        self.host = ctx.host
+        self.headers = scan_headers(ctx)
+        self.active = ctx.active_mode
+        self._budget = WEB_SCENARIO_REQUEST_BUDGET
+        self._reported: set[tuple[str, str]] = set()
+        self._debug_evidence: str = ""
+
+        findings: list[Finding] = []
+        notes: list[str] = []
+        root = base_url(ctx.target_url)
+
+        pages = self._crawl(ctx, root)
+        if not pages:
+            return {"assets": {"web_scenarios": {"status": "target-unreachable"}}, "findings": [], "notes": []}
+
+        points = self._collect_points(pages)
+
+        # Пассивные проверки — всегда.
+        findings += self._check_cors(root)
+        findings += self._check_xff_trust(root, pages)
+        findings += self._check_debug_and_secrets(pages)
+
+        if self.active:
+            for point in points:
+                findings += self._probe_point(point)
+            findings += self._probe_idor(points, pages)
+            findings += self._probe_sensitive_forms(points)
+            findings += self._probe_ssrf(points)
+        else:
+            notes.append(
+                "Прикладные активные пробы (SQLi/XSS/инъекции/IDOR/оплата/вход/SSRF) пропущены: "
+                "включите активный профиль проверки."
+            )
+
+        if self._debug_evidence:
+            findings.append(
+                Finding(
+                    "Раскрытие отладочной трассировки (debug-режим)",
+                    "Высокий",
+                    "Security misconfiguration",
+                    self.label,
+                    "При ошибке приложение возвращает подробную трассировку стека (framework debug): исходный код, пути на сервере и, у Werkzeug, интерактивную консоль. Это раскрывает внутреннее устройство и может приводить к выполнению кода.",
+                    evidence=f"{self._debug_evidence}: ответ содержит отладочную трассировку/консоль.",
+                    remediation="Отключите debug в продакшене (debug=False, FLASK_DEBUG=0); отдавайте обобщённые страницы ошибок и логируйте детали на сервере.",
+                    cwe=["CWE-489", "CWE-215"],
+                    confidence="Высокая",
+                )
+            )
+
+        assets = {
+            "web_scenarios": {
+                "status": "completed",
+                "pages_crawled": len(pages),
+                "injection_points": len(points),
+                "active_mode": self.active,
+                "requests_used": WEB_SCENARIO_REQUEST_BUDGET - self._budget,
+            }
+        }
+        return {"assets": assets, "findings": findings, "notes": notes}
+
+    # --- транспорт -------------------------------------------------------
+
+    def _spend(self) -> bool:
+        if self._budget <= 0:
+            return False
+        self._budget -= 1
+        return True
+
+    def _wrap(self, resp: dict[str, Any], url: str) -> dict[str, Any]:
+        body = resp.get("body", "") or ""
+        data = resp.get("json")
+        if data is None and body:
+            try:
+                data = json.loads(body)
+            except (ValueError, TypeError):
+                data = None
+        headers = resp.get("headers", {}) or {}
+        ctype = ""
+        for key, value in headers.items():
+            if key.lower() == "content-type":
+                ctype = value or ""
+                break
+        if not self._debug_evidence and body and any(marker in body for marker in DEBUG_TRACEBACK_MARKERS):
+            self._debug_evidence = url
+        return {
+            "url": url,
+            "status": resp.get("status"),
+            "body": body,
+            "json": data,
+            "headers": headers,
+            "content_type": ctype,
+            "error": resp.get("error"),
+        }
+
+    @staticmethod
+    def _is_error_page(resp: dict[str, Any]) -> bool:
+        status = resp.get("status") or 0
+        body = resp.get("body") or ""
+        return status >= 500 or any(marker in body for marker in DEBUG_TRACEBACK_MARKERS)
+
+    def _get(self, url: str, params: dict[str, Any] | None = None, extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
+        if not self._spend():
+            return {"url": url, "status": None, "body": "", "json": None, "headers": {}, "content_type": "", "error": "request budget exhausted"}
+        target = url
+        if params:
+            query = urlencode({key: ("" if value is None else str(value)) for key, value in params.items()})
+            target = url + ("&" if "?" in url else "?") + query
+        headers = dict(self.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        return self._wrap(fetch(target, "GET", read_limit=80_000, headers=headers), target)
+
+    def _post(self, url: str, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
+        if not self._spend():
+            return {"url": url, "status": None, "body": "", "json": None, "headers": {}, "content_type": "", "error": "request budget exhausted"}
+        headers = dict(self.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        return self._wrap(post_form(url, payload, headers=headers), url)
+
+    def _request(self, point: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+        values = dict(point["values"])
+        values.update(overrides)
+        if point["method"] == "POST":
+            return self._post(point["action"], values)
+        return self._get(point["action"], values)
+
+    def _emit_once(self, vuln_class: str, action: str) -> bool:
+        key = (vuln_class, route_template(action.split("?")[0]))
+        if key in self._reported:
+            return False
+        self._reported.add(key)
+        return True
+
+    # --- крауль и сбор точек --------------------------------------------
+
+    def _crawl(self, ctx: ScanContext, root: str) -> dict[str, dict[str, Any]]:
+        pages: dict[str, dict[str, Any]] = {}
+        queue: list[str] = []
+        seen: set[str] = set()
+        seen_routes: set[str] = set()
+
+        def enqueue(candidate: str) -> None:
+            # По одному представителю на шаблон маршрута: /product/{id} краулится
+            # один раз, а не по разу на каждый товар — бюджет идёт на новые пути.
+            if candidate in seen or is_static_asset(candidate):
+                return
+            route = route_template(candidate.split("?")[0])
+            if route in seen_routes:
+                return
+            seen.add(candidate)
+            seen_routes.add(route)
+            queue.append(candidate)
+
+        for seed in (ctx.target_url, root + "/"):
+            enqueue(seed)
+        while queue and len(pages) < WEB_SCENARIO_MAX_PAGES and self._budget > 0:
+            url = queue.pop(0)
+            resp = self._get(url)
+            if resp.get("error") or not resp.get("status"):
+                continue
+            pages[url] = resp
+            body = resp["body"]
+            # Ссылки и формы берём только со страниц, отдающих HTML, — не со
+            # случайно связанного JSON/текста и тем более не со статики.
+            if "html" not in resp["content_type"].lower() and "<html" not in body.lower():
+                continue
+            for link in extract_in_scope_links(body, url, ctx.host):
+                enqueue(link)
+        return pages
+
+    def _collect_points(self, pages: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, tuple[str, ...]]] = set()
+
+        def add(method: str, action: str, names: list[str], values: dict[str, Any], has_password: bool = False) -> None:
+            names = [name for name in names if name][:WEB_SCENARIO_MAX_PARAMS]
+            if not names:
+                return
+            key = (method, route_template(action.split("?")[0]), tuple(sorted(names)))
+            if key in seen:
+                return
+            seen.add(key)
+            points.append({"method": method, "action": action, "params": names, "values": values, "has_password": has_password})
+
+        for url, resp in pages.items():
+            body = resp["body"]
+            is_html = "html" in (resp["content_type"] or "").lower() or "<html" in body.lower()
+            if is_html and "<form" in body.lower():
+                for form in extract_form_security_details(body, url):
+                    names = list(form["input_names"])
+                    add(form["method"], form["action"], names, {name: "bdu" for name in names}, bool(form.get("has_password")))
+            parsed = urlparse(url)
+            if parsed.query:
+                parsed_qs = parse_qs(parsed.query)
+                base = url.split("?")[0]
+                add("GET", base, list(parsed_qs), {key: (vals[0] if vals else "bdu") for key, vals in parsed_qs.items()})
+
+        return points[:WEB_SCENARIO_MAX_POINTS]
+
+    # --- пассивные проверки ---------------------------------------------
+
+    def _check_cors(self, root: str) -> list[Finding]:
+        probe_origin = "https://bdu-cors-probe.example"
+        resp = self._get(root + "/", extra_headers={"Origin": probe_origin})
+        acao = ""
+        acac = ""
+        for key, value in resp["headers"].items():
+            lowered = key.lower()
+            if lowered == "access-control-allow-origin":
+                acao = (value or "").strip()
+            elif lowered == "access-control-allow-credentials":
+                acac = (value or "").strip().lower()
+        if not acao:
+            return []
+        reflected = acao == probe_origin
+        wildcard = acao == "*"
+        if not (reflected or wildcard):
+            return []
+        with_credentials = acac == "true"
+        if reflected and with_credentials:
+            severity = "Высокий"
+        elif wildcard and with_credentials:
+            severity = "Высокий"
+        else:
+            severity = "Средний"
+        evidence = f"Origin: {probe_origin} -> Access-Control-Allow-Origin: {acao}"
+        if acac:
+            evidence += f"; Access-Control-Allow-Credentials: {acac}"
+        return [
+            Finding(
+                "Небезопасная политика CORS",
+                severity,
+                "CORS misconfiguration",
+                self.label,
+                "Сервер разрешает кросс-доменные запросы со слишком широкой политикой. Любой сторонний сайт может читать ответы приложения в браузере жертвы"
+                + (", причём вместе с учётными данными (Allow-Credentials: true)." if with_credentials else "."),
+                evidence=evidence,
+                remediation="Разрешайте только доверённый список источников; никогда не сочетайте '*' или отражённый Origin с Access-Control-Allow-Credentials: true.",
+                cwe=["CWE-942"],
+                confidence="Высокая",
+            )
+        ]
+
+    def _check_xff_trust(self, root: str, pages: dict[str, dict[str, Any]]) -> list[Finding]:
+        marker_ip = "203.0.113.177"
+        candidates = [root + "/"]
+        for url, resp in pages.items():
+            if resp["json"] is not None and len(candidates) < 6:
+                candidates.append(url.split("?")[0])
+        for url in dict.fromkeys(candidates):
+            resp = self._get(url, extra_headers={"X-Forwarded-For": marker_ip})
+            if marker_ip in (resp["body"] or ""):
+                return [
+                    Finding(
+                        "Доверие к клиентскому заголовку X-Forwarded-For",
+                        "Средний",
+                        "Broken access control",
+                        self.label,
+                        "Приложение использует клиентский заголовок X-Forwarded-For как источник IP без доверенного прокси. Адрес можно подделать для обхода журналирования, геоограничений, лимитов и списков доступа.",
+                        evidence=f"{url}: заголовок X-Forwarded-For: {marker_ip} отражён в ответе приложения",
+                        remediation="Определяйте IP только из доверенного обратного прокси (например, ProxyFix с числом доверенных хопов); не доверяйте X-Forwarded-For напрямую.",
+                        cwe=["CWE-348"],
+                        confidence="Высокая",
+                    )
+                ]
+        return []
+
+    def _check_debug_and_secrets(self, pages: dict[str, dict[str, Any]]) -> list[Finding]:
+        findings: list[Finding] = []
+        debug_reported = False
+        secret_reported: set[str] = set()
+        for url, resp in pages.items():
+            data = resp["json"]
+            body = resp["body"] or ""
+            if not debug_reported and isinstance(data, dict) and data.get("debug") is True:
+                debug_reported = True
+                findings.append(
+                    Finding(
+                        "Включён режим отладки приложения",
+                        "Высокий",
+                        "Security misconfiguration",
+                        self.label,
+                        "Ответ приложения сообщает, что включён режим отладки. В эксплуатации это раскрывает трассировки и внутренние данные, а у части фреймворков даёт выполнение кода через интерактивный отладчик.",
+                        evidence=f"{url}: \"debug\": true",
+                        remediation="Отключите режим отладки в продакшене (FLASK_DEBUG=0, app.debug=False, DEBUG=False) и уберите диагностические эндпоинты из публичного доступа.",
+                        cwe=["CWE-489"],
+                        confidence="Высокая",
+                    )
+                )
+            for name, pattern in SECRET_RESPONSE_PATTERNS:
+                match = pattern.search(body)
+                if match and name not in secret_reported:
+                    secret_reported.add(name)
+                    findings.append(
+                        Finding(
+                            f"Секрет в HTTP-ответе ({name})",
+                            "Высокий",
+                            "Sensitive data exposure",
+                            self.label,
+                            "В теле ответа найдена строка, похожая на ключ/токен/пароль. Секреты не должны попадать в ответы приложения.",
+                            evidence=f"{url}: {mask_secret(match.group(0))}",
+                            remediation="Уберите секреты из ответов и исходного кода, ротируйте раскрытые значения и храните их в защищённом секрет-хранилище.",
+                            cwe=["CWE-798", "CWE-200"],
+                            confidence="Средняя",
+                        )
+                    )
+        return findings
+
+    # --- активные пробы точек внедрения ---------------------------------
+
+    def _probe_point(self, point: dict[str, Any]) -> list[Finding]:
+        findings: list[Finding] = []
+        action = point["action"]
+        for param in point["params"]:
+            if self._budget <= 0:
+                break
+            findings += self._probe_markers(point, param)
+            findings += self._probe_sqli(point, param)
+            findings += self._probe_traversal(point, param)
+            findings += self._probe_xss(point, param)
+        return findings
+
+    def _probe_markers(self, point: dict[str, Any], param: str) -> list[Finding]:
+        findings: list[Finding] = []
+        action = point["action"]
+        # Базлайн с ПУСТЫМ значением параметра: если маркер присутствует и без
+        # нашей нагрузки (страница сама упоминает строку-маркер), это не наше
+        # срабатывание — такой маркер пропускаем. Пустое значение, а не токен,
+        # важно: часть приёмников (десериализация) реагирует на любой непустой
+        # ввод, и токен-базлайн ложно глушил бы находку.
+        baseline_body = (self._request(point, {param: ""})["body"] or "")
+        for title, cwe, payload, detector in self.MARKER_PROBES:
+            if self._budget <= 0:
+                break
+            if detector(baseline_body):
+                continue
+            resp = self._request(point, {param: payload})
+            if detector(resp["body"] or "") and self._emit_once(title, action):
+                findings.append(
+                    Finding(
+                        title,
+                        "Высокий",
+                        "Injection",
+                        self.label,
+                        f"Параметр '{param}' эндпоинта обрабатывается как опасный приёмник: приложение подтвердило срабатывание проверочной нагрузкой.",
+                        evidence=f"{point['method']} {action}, параметр {param}: нагрузка {payload!r} распознана приложением.",
+                        remediation="Экранируйте/валидируйте ввод, используйте безопасные API (параметризация, запрет внешних сущностей, безопасная десериализация, отказ от шаблонизации пользовательского ввода).",
+                        cwe=cwe,
+                        confidence="Высокая",
+                    )
+                )
+        return findings
+
+    def _probe_sqli(self, point: dict[str, Any], param: str) -> list[Finding]:
+        action = point["action"]
+        if ("SQL-инъекция", action) in [(k[0], k[1]) for k in self._reported]:
+            return []
+        token = uuid.uuid4().hex[:10]
+        baseline = self._request(point, {param: "bdu" + token})
+        error_resp = self._request(point, {param: "bdu'" + token})
+        true_resp = self._request(point, {param: "bdu' OR '1'='1' -- "})
+
+        sql_err_re = re.compile(r"sql|sqlite|syntax error|unrecognized token|unterminated|SQLITE_ERROR|near \"", re.I)
+        error_based = (
+            bool(sql_err_re.search(error_resp["body"] or ""))
+            and not sql_err_re.search(baseline["body"] or "")
+        )
+
+        def magnitude(resp: dict[str, Any]) -> int:
+            data = resp["json"]
+            if isinstance(data, dict):
+                if isinstance(data.get("count"), int):
+                    return data["count"]
+                for value in data.values():
+                    if isinstance(value, list):
+                        return len(value)
+            return len(resp["body"] or "")
+
+        base_mag = magnitude(baseline)
+        true_mag = magnitude(true_resp)
+        boolean_based = true_mag > base_mag and (true_mag - base_mag) >= max(1, base_mag)
+
+        if (error_based or boolean_based) and self._emit_once("SQL-инъекция", action):
+            how = "error-based (синтаксическая ошибка SQL в ответе)" if error_based else "boolean-based (рост объёма выборки при истинном условии)"
+            return [
+                Finding(
+                    "SQL-инъекция",
+                    "Критический",
+                    "Injection",
+                    self.label,
+                    f"Параметр '{param}' подставляется в SQL-запрос без параметризации. Признак: {how}.",
+                    evidence=f"{point['method']} {action}, параметр {param}: базовая выборка {base_mag}, при \"' OR '1'='1' --\" — {true_mag}.",
+                    remediation="Используйте параметризованные запросы/ORM-биндинг, не собирайте SQL конкатенацией пользовательского ввода.",
+                    cwe=["CWE-89"],
+                    confidence="Высокая",
+                )
+            ]
+        return []
+
+    def _probe_traversal(self, point: dict[str, Any], param: str) -> list[Finding]:
+        action = point["action"]
+        for payload in ("/etc/passwd", "../../../../../../etc/passwd"):
+            if self._budget <= 0:
+                break
+            resp = self._request(point, {param: payload})
+            body = resp["body"] or ""
+            if (PASSWD_RE.search(body) or "# User Database" in body or "LOCAL_PASSWD_FIXTURE" in body) and self._emit_once("Path traversal", action):
+                return [
+                    Finding(
+                        "Чтение произвольных файлов (path traversal)",
+                        "Высокий",
+                        "Path traversal",
+                        self.label,
+                        f"Параметр '{param}' позволяет обратиться к файлу вне ожидаемого каталога — в ответе получено содержимое системного файла.",
+                        evidence=f"{point['method']} {action}, параметр {param}: нагрузка {payload!r} вернула содержимое /etc/passwd.",
+                        remediation="Не используйте пользовательский ввод как путь: сопоставляйте с белым списком, нормализуйте и проверяйте, что итоговый путь внутри разрешённого каталога.",
+                        cwe=["CWE-22"],
+                        confidence="Высокая",
+                    )
+                ]
+        return []
+
+    def _probe_xss(self, point: dict[str, Any], param: str) -> list[Finding]:
+        action = point["action"]
+        token = uuid.uuid4().hex[:8]
+        marker = f"<bduxss{token}>"
+        resp = self._request(point, {param: marker})
+        body = resp["body"] or ""
+        is_json = "json" in (resp["content_type"] or "").lower()
+        # Маркер должен вернуться сырым (неэкранированным) и не на странице
+        # ошибки/отладчика — там ввод экранируется, это не XSS.
+        if marker in body and not is_json and not self._is_error_page(resp) and self._emit_once("Отражённый XSS", action):
+            return [
+                Finding(
+                    "Отражённый межсайтовый скриптинг (XSS)",
+                    "Высокий",
+                    "Cross-site scripting",
+                    self.label,
+                    f"Значение параметра '{param}' возвращается в HTML-ответе без экранирования, поэтому в него можно внедрить исполняемый скрипт.",
+                    evidence=f"{point['method']} {action}, параметр {param}: маркер {marker} отражён как сырой HTML.",
+                    remediation="Экранируйте вывод по контексту (HTML/атрибут/JS), включите CSP и используйте автоэкранирование шаблонизатора.",
+                    cwe=["CWE-79"],
+                    confidence="Высокая",
+                )
+            ]
+        return []
+
+    # --- IDOR / бизнес-логика -------------------------------------------
+
+    def _probe_idor(self, points: list[dict[str, Any]], pages: dict[str, dict[str, Any]]) -> list[Finding]:
+        findings: list[Finding] = []
+        numeric_re = re.compile(r"^(?P<prefix>.*/)(?P<id>\d{1,7})/?$")
+
+        # Кандидаты с числовым сегментом в пути: из посещённых страниц и ссылок.
+        bases: dict[str, int] = {}
+        candidate_urls: set[str] = set(pages.keys())
+        for url, resp in pages.items():
+            for link in extract_in_scope_links(resp["body"], url, self.host):
+                candidate_urls.add(link)
+        for url in candidate_urls:
+            parsed = urlparse(url)
+            match = numeric_re.match(parsed.path)
+            if match:
+                base = f"{parsed.scheme}://{parsed.netloc}{match.group('prefix')}"
+                bases.setdefault(base, int(match.group("id")))
+
+        for base, sample_id in list(bases.items())[:3]:
+            if self._budget <= 0:
+                break
+            ids = []
+            for candidate in (1, 2, 3, sample_id, sample_id + 1):
+                if candidate >= 1 and candidate not in ids:
+                    ids.append(candidate)
+            bodies: dict[int, str] = {}
+            for identifier in ids[:5]:
+                resp = self._get(f"{base}{identifier}")
+                if resp["status"] == 200 and resp["body"]:
+                    bodies[identifier] = body_signature(resp["body"])
+            distinct = len(set(bodies.values()))
+            if len(bodies) >= 2 and distinct >= 2 and self._emit_once("IDOR", base):
+                findings.append(
+                    Finding(
+                        "Небезопасная прямая ссылка на объект (IDOR)",
+                        "Высокий",
+                        "Broken access control",
+                        self.label,
+                        "Объект доступен по числовому идентификатору без проверки владельца: соседние идентификаторы возвращают разные записи без аутентификации.",
+                        evidence=f"{base}{{id}}: доступны идентификаторы {sorted(bodies)} с различным содержимым.",
+                        remediation="Проверяйте, что запрошенный объект принадлежит текущему пользователю (авторизация на уровне объекта); используйте непоследовательные идентификаторы как дополнительную меру.",
+                        cwe=["CWE-639"],
+                        confidence="Высокая",
+                    )
+                )
+
+        # Параметрические идентификаторы: ?customer_id=, ?id=, ?account=
+        id_param_re = re.compile(r"(^id$|_id$|^account$|^customer$|^user$|^order$)", re.I)
+        for point in points:
+            if self._budget <= 0:
+                break
+            id_params = [name for name in point["params"] if id_param_re.search(name)]
+            for param in id_params:
+                signatures: dict[str, str] = {}
+                for value in ("1001", "1002", "1"):
+                    resp = self._request(point, {param: value})
+                    if resp["status"] == 200 and resp["body"]:
+                        signatures[value] = body_signature(resp["body"])
+                if len(set(signatures.values())) >= 2 and self._emit_once("IDOR", point["action"] + "?" + param):
+                    findings.append(
+                        Finding(
+                            "Небезопасная прямая ссылка на объект (IDOR)",
+                            "Высокий",
+                            "Broken access control",
+                            self.label,
+                            f"Параметр '{param}' позволяет читать данные других учётных записей без проверки владельца.",
+                            evidence=f"{point['action']}, параметр {param}: разные значения возвращают разные записи без аутентификации.",
+                            remediation="Связывайте объект с текущей сессией и проверяйте право доступа к каждому запрошенному идентификатору.",
+                            cwe=["CWE-639"],
+                            confidence="Высокая",
+                        )
+                    )
+        return findings
+
+    def _probe_sensitive_forms(self, points: list[dict[str, Any]]) -> list[Finding]:
+        findings: list[Finding] = []
+        for point in points:
+            if self._budget <= 0:
+                break
+            if point["method"] != "POST":
+                continue
+            names_lower = [name.lower() for name in point["params"]]
+            action = point["action"]
+
+            # Подмена суммы/статуса оплаты.
+            if any(name in names_lower for name in ("amount", "price", "total", "sum")):
+                payload: dict[str, Any] = {}
+                for name in point["params"]:
+                    lowered = name.lower()
+                    if lowered in ("amount", "price", "total", "sum"):
+                        payload[name] = "1"
+                    elif lowered == "status":
+                        payload[name] = "paid"
+                    elif lowered in ("username", "user", "login"):
+                        payload[name] = "test"
+                    else:
+                        payload[name] = "bdu"
+                resp = self._post(action, payload)
+                data = resp["json"]
+                accepted = resp["status"] == 200 and isinstance(data, dict) and (
+                    data.get("ok") is True or str(data.get("amount")) == "1" or data.get("status") == "paid"
+                )
+                if accepted and self._emit_once("Подмена оплаты", action):
+                    findings.append(
+                        Finding(
+                            "Доверие к клиентским данным оплаты",
+                            "Высокий",
+                            "Business logic",
+                            self.label,
+                            "Эндпоинт оплаты принимает сумму и/или статус оплаты от клиента без серверной проверки — можно занизить сумму и подделать статус «оплачено».",
+                            evidence=f"{action}: amount=1, status=paid принято -> {json.dumps(data, ensure_ascii=False)[:200]}",
+                            remediation="Считайте сумму на сервере из корзины/прайса; статус оплаты подтверждайте только у платёжного провайдера, не доверяйте клиенту.",
+                            cwe=["CWE-602", "CWE-840"],
+                            confidence="Высокая",
+                        )
+                    )
+
+            # Отсутствие ограничителя попыток входа — только для форм входа,
+            # не для регистрации.
+            is_register = re.search(r"regist|signup|sign-?up|регистр", action, re.I)
+            is_login = re.search(r"login|signin|sign-?in|authenticate|auth\b|вход", action, re.I)
+            has_identity = any(name.lower() in ("username", "user", "login", "email") for name in point["params"])
+            if point.get("has_password") and not is_register and (is_login or has_identity):
+                statuses: list[Any] = []
+                limited = False
+                lockout_re = re.compile(r"too many|rate.?limit|locked|заблокир|повторите через|слишком много", re.I)
+                for attempt in range(6):
+                    if self._budget <= 0:
+                        break
+                    payload = {}
+                    for name in point["params"]:
+                        lowered = name.lower()
+                        if "pass" in lowered:
+                            payload[name] = f"wrong-{attempt}-{uuid.uuid4().hex[:6]}"
+                        elif lowered in ("username", "user", "login", "email"):
+                            payload[name] = "bdu_nouser_probe"
+                        else:
+                            payload[name] = "bdu"
+                    resp = self._post(action, payload)
+                    statuses.append(resp["status"])
+                    if resp["status"] == 429 or (isinstance(resp["json"], dict) and lockout_re.search(json.dumps(resp["json"], ensure_ascii=False))):
+                        limited = True
+                        break
+                if statuses and not limited and self._emit_once("Нет лимита входа", action):
+                    findings.append(
+                        Finding(
+                            "Отсутствует ограничение попыток входа",
+                            "Средний",
+                            "Broken authentication",
+                            self.label,
+                            "Форма входа принимает неограниченное число неверных попыток без троттлинга/блокировки и без HTTP 429 — это открывает перебор паролей.",
+                            evidence=f"{action}: 6 неверных попыток подряд, коды ответа {statuses}, троттлинга нет.",
+                            remediation="Добавьте ограничение частоты и временную блокировку по аккаунту/IP, CAPTCHA после нескольких неудач и журналирование.",
+                            cwe=["CWE-307"],
+                            confidence="Средняя",
+                        )
+                    )
+
+            # Предсказуемый код сброса/подтверждения.
+            if re.search(r"reset|forgot|recover|otp|сброс|восстан", action, re.I):
+                resp = self._post(action, {name: "test" for name in point["params"]})
+                data = resp["json"]
+                token = ""
+                if isinstance(data, dict):
+                    for key in ("token", "code", "otp", "reset_token", "pin"):
+                        value = data.get(key)
+                        if value:
+                            token = str(value)
+                            break
+                if token and re.fullmatch(r"\d{4,8}", token) and self._emit_once("Предсказуемый код", action):
+                    findings.append(
+                        Finding(
+                            "Предсказуемый код сброса/подтверждения",
+                            "Средний",
+                            "Weak randomness",
+                            self.label,
+                            "Эндпоинт восстановления доступа выдаёт короткий числовой код. Малое пространство значений и некриптостойкая генерация делают код подбираемым.",
+                            evidence=f"{action}: выдан код {token} (длина {len(token)}, только цифры).",
+                            remediation="Генерируйте токены криптостойко (модуль secrets), делайте их длинными (>=128 бит), ограничивайте число попыток и срок действия.",
+                            cwe=["CWE-330"],
+                            confidence="Средняя",
+                        )
+                    )
+        return findings
+
+    def _probe_ssrf(self, points: list[dict[str, Any]]) -> list[Finding]:
+        findings: list[Finding] = []
+        url_param_re = re.compile(r"(^url$|^uri$|link|callback|dest|target|fetch|image|src|feed|webhook)", re.I)
+        parsed_target = urlparse(self.ctx.target_url)
+        own_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80)
+        fixture = f"http://127.0.0.1:{own_port}/api/ssrf-fixture"
+        for point in points:
+            if self._budget <= 0:
+                break
+            url_params = [name for name in point["params"] if url_param_re.search(name)]
+            for param in url_params:
+                resp = self._request(point, {param: fixture})
+                data = resp["json"]
+                # Требуем структурированный признак серверной загрузки (поле в
+                # JSON), а не просто наличие строки в теле — иначе статика/
+                # фронтенд с упоминанием адреса давали бы ложное срабатывание.
+                fetched = isinstance(data, dict) and ("fetched" in data or data.get("url") == fixture)
+                if fetched and self._emit_once("SSRF", point["action"]):
+                    findings.append(
+                        Finding(
+                            "Загрузка по URL на стороне сервера (SSRF)",
+                            "Средний",
+                            "Server-side request forgery",
+                            self.label,
+                            f"Параметр '{param}' заставляет сервер выполнять HTTP-запрос по указанному адресу. Даже с текущими ограничениями это поверхность для SSRF (доступ к внутренним сервисам/метаданным при ослаблении фильтра).",
+                            evidence=f"{point['method']} {point['action']}, параметр {param}: сервер загрузил {fixture} и вернул его содержимое.",
+                            remediation="Запретите произвольные адреса: белый список хостов/схем, запрет приватных диапазонов и редиректов, таймауты и изоляция исходящих запросов.",
+                            cwe=["CWE-918"],
+                            confidence="Средняя",
+                        )
+                    )
+        return findings
+
+
 class NmapAdapter:
     key = "nmap"
     label = "Nmap"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("nmap")
+        path = find_tool_binary("nmap")
         if not path:
-            findings, assets = socket_port_scan(ctx.host)
-            return {
-                "assets": {"nmap_fallback": assets},
-                "findings": findings,
-                "notes": ["Nmap не найден в PATH, использован встроенный socket-сканер портов."],
-            }
-        cmd = [
-            path,
-            "-Pn",
-            "-T4",
-            "-F",
-            "--max-retries",
-            "1",
-            "--host-timeout",
-            "45s",
-            "--version-intensity",
-            "2",
-            "--open",
-            "-sV",
-            "-oX",
-            "-",
-            ctx.host,
-        ]
-        result = run_command(cmd, EXTERNAL_TIMEOUTS["nmap"])
+            return network_fallback_result(ctx, "Nmap не найден, использована встроенная TCP-инвентаризация.")
+        target = ctx.network if ctx.target_kind == "network" and ctx.network else ctx.host
+        cmd = [path, "-T4", "--open", "-sV"]
+        if ctx.wait_for_completion:
+            cmd.append("--version-all")
+        else:
+            cmd.extend(["--max-retries", "1", "--host-timeout", "45s", "--version-light"])
+        if ctx.target_kind == "network":
+            cmd.extend(["--top-ports", "1000" if ctx.wait_for_completion else "100"])
+        else:
+            explicit_port = target_url_port(ctx.target_url) if ctx.target_kind == "ip" else None
+            if ctx.wait_for_completion:
+                cmd.extend(["-Pn", "-p-"])
+            elif explicit_port:
+                port_list = ",".join(str(port) for port in sorted({*COMMON_TCP_PORTS, explicit_port}))
+                cmd.extend(["-Pn", "-p", port_list])
+            else:
+                cmd.extend(["-Pn", "-F"])
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cmd.extend(["-O", "--osscan-limit"])
+        cmd.extend(["-oX", "-", target])
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["nmap"])
         if result["returncode"] not in {0, 1}:
-            findings, assets = socket_port_scan(ctx.host)
-            return {
-                "assets": {"nmap_fallback": assets},
-                "findings": findings,
-                "notes": [f"Nmap не успел завершиться, использован встроенный socket-сканер портов. Причина: {result['stderr'][:260]}"],
-            }
+            reason = result["stderr"][:260]
+            return network_fallback_result(ctx, f"Nmap не завершился; использована встроенная TCP-инвентаризация. Причина: {reason}")
         findings, assets = parse_nmap_xml(result["stdout"])
-        return {"assets": {"nmap": assets}, "findings": findings, "notes": []}
+        notes = []
+        if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+            notes.append("Nmap запущен без root: точное OS fingerprinting недоступно, поэтому в отчёте также используется эвристика по сервисам.")
+        return {"assets": {"nmap": assets}, "findings": findings, "notes": notes}
+
+
+def network_fallback_result(ctx: ScanContext, note: str) -> dict[str, Any]:
+    result = NetworkSystemAnalyzer().run(ctx)
+    systems = result.get("assets", {}).get("systems", [])
+    flat_ports = [
+        {**port, "host": system.get("ip", "")}
+        for system in systems
+        for port in system.get("open_ports", [])
+    ]
+    fallback = {
+        "scanner": "built-in TCP inventory",
+        "ports": flat_ports,
+        "hosts": systems,
+    }
+    assets = dict(result.get("assets", {}))
+    assets["nmap_fallback"] = fallback
+    return {
+        "assets": assets,
+        "findings": result.get("findings", []),
+        "notes": [note, *result.get("notes", [])],
+    }
+
+
+def scanner_timeout_note(label: str, result: dict[str, Any]) -> str:
+    seconds = result.get("timeout")
+    suffix = f" через {int(seconds)} с" if isinstance(seconds, (int, float)) else ""
+    return f"{label}: остановлен предохранителем{suffix}; отчёт продолжен, частичные результаты сохранены где это возможно."
 
 
 class WapitiAdapter:
@@ -778,10 +2613,6 @@ class WapitiAdapter:
         config_dir = private_root / "config"
         session_dir.mkdir(parents=True, exist_ok=True)
         config_dir.mkdir(parents=True, exist_ok=True)
-        max_links = "140" if ctx.injection_profile else "60"
-        depth = "3" if ctx.injection_profile else "2"
-        max_scan_time = "420" if ctx.injection_profile else "180"
-        max_attack_time = "120" if ctx.injection_profile else "60"
         cmd = [
             path,
             "-u",
@@ -796,14 +2627,6 @@ class WapitiAdapter:
             "folder",
             "--timeout",
             "10",
-            "--max-links",
-            max_links,
-            "--depth",
-            depth,
-            "--max-scan-time",
-            max_scan_time,
-            "--max-attack-time",
-            max_attack_time,
             "--store-session",
             str(session_dir),
             "--store-config",
@@ -811,6 +2634,17 @@ class WapitiAdapter:
             "--flush-session",
             "--no-bugreport",
         ]
+        if not ctx.wait_for_completion:
+            max_links = "140" if ctx.injection_profile else "60"
+            depth = "3" if ctx.injection_profile else "2"
+            max_scan_time = "420" if ctx.injection_profile else "180"
+            max_attack_time = "120" if ctx.injection_profile else "60"
+            cmd.extend([
+                "--max-links-per-page", max_links,
+                "--depth", depth,
+                "--max-scan-time", max_scan_time,
+                "--max-attack-time", max_attack_time,
+            ])
         if ctx.auth_cookie:
             cmd.extend(["--cookie-value", ctx.auth_cookie])
         header_value = cli_header_value(ctx.auth_header)
@@ -818,7 +2652,15 @@ class WapitiAdapter:
             cmd.extend(["--header", header_value])
         if ctx.target_url.startswith("https://"):
             cmd.extend(["--verify-ssl", "0"])
-        result = run_command(cmd, EXTERNAL_TIMEOUTS["wapiti"])
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["wapiti"])
+        if result.get("timed_out"):
+            findings = parse_wapiti_json(out) if out.exists() else []
+            return {
+                "assets": {"external_reports": [{"tool": "Wapiti", "path": str(out)}]} if out.exists() else {},
+                "findings": findings,
+                "notes": [scanner_timeout_note(self.label, result)],
+                "status": "timeout",
+            }
         if result["returncode"] != 0:
             return {"assets": {}, "findings": [], "notes": [f"Wapiti завершился с ошибкой: {redact_scan_secrets(result['stderr'][:500], ctx)}"]}
         findings = parse_wapiti_json(out)
@@ -830,7 +2672,7 @@ class WfuzzAdapter:
     label = "Wfuzz"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("wfuzz")
+        path = find_tool_binary("wfuzz")
         if not path:
             findings, assets = builtin_content_discovery(ctx, WORDLIST_DIR / "web_common.txt")
             return {
@@ -851,7 +2693,7 @@ class WfuzzAdapter:
             f"{out},json",
             fuzz_url,
         ]
-        result = run_command(cmd, EXTERNAL_TIMEOUTS["wfuzz"])
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["wfuzz"], env=tool_environment("wfuzz"))
         findings: list[Finding] = []
         if out.exists():
             findings.extend(parse_wfuzz_json(out))
@@ -865,7 +2707,7 @@ class WhatWebAdapter:
     label = "WhatWeb"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("whatweb")
+        path = find_tool_binary("whatweb")
         if not path:
             findings, assets = builtin_technology_fingerprint(ctx)
             return {
@@ -875,7 +2717,7 @@ class WhatWebAdapter:
             }
         out = REPORTS_DIR / f"whatweb_{ctx.scan_id}.json"
         cmd = [path, "--log-json", str(out), ctx.target_url]
-        result = run_command(cmd, EXTERNAL_TIMEOUTS["whatweb"])
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["whatweb"], env=tool_environment("whatweb"))
         if result["returncode"] != 0:
             return {"assets": {}, "findings": [], "notes": [f"WhatWeb завершился с ошибкой: {result['stderr'][:300]}"]}
         return {"assets": {"whatweb": read_json_file(out), "external_reports": [{"tool": "WhatWeb", "path": str(out)}]}, "findings": [], "notes": []}
@@ -886,7 +2728,7 @@ class NiktoAdapter:
     label = "Nikto"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("nikto")
+        path = find_tool_binary("nikto")
         if not path:
             findings, assets = builtin_nikto_lite(ctx)
             return {
@@ -896,8 +2738,15 @@ class NiktoAdapter:
             }
         out = REPORTS_DIR / f"nikto_{ctx.scan_id}.json"
         cmd = [path, "-host", ctx.target_url, "-Format", "json", "-output", str(out), "-nointeractive"]
-        result = run_command(cmd, EXTERNAL_TIMEOUTS["nikto"])
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["nikto"])
         findings = parse_nikto_json(out) if out.exists() else []
+        if result.get("timed_out"):
+            return {
+                "assets": {"external_reports": [{"tool": "Nikto", "path": str(out)}]} if out.exists() else {},
+                "findings": findings,
+                "notes": [scanner_timeout_note(self.label, result)],
+                "status": "timeout",
+            }
         if result["returncode"] not in {0, 1}:
             return {"assets": {}, "findings": findings, "notes": [f"Nikto завершился с ошибкой: {result['stderr'][:300]}"]}
         return {"assets": {"external_reports": [{"tool": "Nikto", "path": str(out)}]}, "findings": findings, "notes": []}
@@ -908,13 +2757,13 @@ class SQLMapAdapter:
     label = "SQLMap"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("sqlmap") or shutil.which("sqlmap.py")
+        path = find_tool_binary("sqlmap") or shutil.which("sqlmap.py")
         if not path:
             return {"assets": {}, "findings": [], "notes": ["SQLMap не найден в PATH."]}
         out_dir = REPORTS_DIR / f"sqlmap_{ctx.scan_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
         raw_request_path: Path | None = None
-        cmd = [path]
+        cmd = [sys.executable, path] if path.endswith(".py") else [path]
         if ctx.raw_request:
             raw_request_path = Path(tempfile.gettempdir()) / f"bdu_sqlmap_{ctx.scan_id}.req"
             raw_request_path.write_text(ctx.raw_request, encoding="utf-8")
@@ -940,7 +2789,7 @@ class SQLMapAdapter:
         if header_value:
             cmd.extend([f"--headers={header_value}"])
         try:
-            result = run_command(cmd, EXTERNAL_TIMEOUTS["sqlmap"])
+            result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS["sqlmap"])
         finally:
             if raw_request_path:
                 try:
@@ -964,9 +2813,13 @@ class SQLMapAdapter:
                 )
             )
         notes = []
+        status = ""
+        if result.get("timed_out"):
+            notes.append(scanner_timeout_note(self.label, result))
+            status = "timeout"
         if result["returncode"] not in {0, 1}:
             notes.append(f"SQLMap завершился с предупреждением: {redact_scan_secrets(result['stderr'][:400], ctx)}")
-        return {
+        response = {
             "assets": {
                 "external_reports": [{"tool": "SQLMap", "path": str(out_dir)}],
                 "sqlmap": {
@@ -981,42 +2834,186 @@ class SQLMapAdapter:
             "findings": findings,
             "notes": notes,
         }
+        if status:
+            response["status"] = status
+        return response
 
 
-class OpenVASAdapter:
-    key = "openvas"
-    label = "OpenVAS-lite"
+class TheHarvesterAdapter:
+    key = "theharvester"
+    label = "theHarvester"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        if "nmap" in ctx.selected_tools:
+        path = find_tool_binary(self.key)
+        if not path:
             return {
-                "assets": {"openvas_lite": {"skipped": "network baseline covered by Nmap"}},
+                "assets": {},
                 "findings": [],
-                "notes": ["OpenVAS-lite сетевой baseline пропущен: выбран Nmap для сетевых портов."],
+                "notes": ["theHarvester не найден. Включите автоустановку или установите его из официального репозитория."],
             }
-        findings, assets = socket_port_scan(ctx.host)
-        if not findings and assets.get("ports"):
-            findings.append(
-                Finding(
-                    "Сетевые порты обнаружены без критичных признаков",
-                    "Инфо",
-                    "Network baseline",
-                    "OpenVAS-lite",
-                    "Встроенный сетевой baseline обнаружил открытые TCP-порты, но среди них нет типично рискованных сервисов из короткого профиля.",
-                    evidence=json.dumps(assets.get("ports", []), ensure_ascii=False),
-                    remediation="Для полноценной проверки CVE используйте Greenbone/OpenVAS с актуальным NVT feed или Nmap NSE/Vulners.",
-                    cwe=["CWE-200"],
-                )
-            )
+        output_base = REPORTS_DIR / f"theharvester_{ctx.scan_id}"
+        cmd = [
+            path,
+            "-d",
+            ctx.host,
+            "-l",
+            "300",
+            "-b",
+            "crtsh,duckduckgo,rapiddns,urlscan",
+            "-f",
+            str(output_base),
+        ]
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS[self.key], env=tool_environment(self.key))
+        candidates = [output_base.with_suffix(".json"), output_base]
+        data = next((read_json_file(item) for item in candidates if item.exists()), {})
+        combined = json.dumps(data, ensure_ascii=False) + "\n" + result["stdout"]
+        subdomains = extract_domains(combined, ctx.host)
+        emails = extract_emails(combined, ctx.host)
+        notes = []
+        if result["returncode"] not in {0, 1}:
+            notes.append(f"theHarvester завершился с предупреждением: {result['stderr'][-400:]}")
         return {
-            "assets": {"openvas_lite": assets},
-            "findings": findings,
-            "notes": ["OpenVAS/Greenbone как платформа не найдена, использован встроенный OpenVAS-lite сетевой baseline."],
+            "assets": {
+                "subdomains": domain_assets(subdomains),
+                "osint_emails": emails,
+                "theharvester": {"subdomains": subdomains, "emails": emails},
+                "external_reports": [{"tool": self.label, "path": str(output_base)}],
+            },
+            "findings": interesting_subdomain_findings(subdomains, self.label),
+            "notes": notes,
         }
 
 
-class BurpAdapter:
-    key = "burp"
+class DNSReconAdapter:
+    key = "dnsrecon"
+    label = "DNSRecon"
+
+    def run(self, ctx: ScanContext) -> dict[str, Any]:
+        path = find_tool_binary(self.key)
+        if not path:
+            return {
+                "assets": {"dnsrecon_lite": {"fallback": "covered by Built-in DNS"}},
+                "findings": [],
+                "notes": ["DNSRecon не найден; NS/SRV/DNSSEC/wildcard/AXFR проверены встроенным DNS-аудитом."],
+            }
+        out = REPORTS_DIR / f"dnsrecon_{ctx.scan_id}.json"
+        cmd = [path, "-d", ctx.host, "-t", "std,axfr,srv", "-j", str(out)]
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS[self.key], env=tool_environment(self.key))
+        data = read_json_file(out) if out.exists() else {}
+        combined = json.dumps(data, ensure_ascii=False) + "\n" + result["stdout"]
+        subdomains = extract_domains(combined, ctx.host)
+        findings = interesting_subdomain_findings(subdomains, self.label)
+        if dnsrecon_axfr_detected(data, result["stdout"]):
+            findings.append(
+                Finding(
+                    "DNSRecon подтвердил доступный AXFR",
+                    "Высокий",
+                    "DNS zone transfer",
+                    self.label,
+                    "DNSRecon получил записи зоны через перенос AXFR.",
+                    evidence=ctx.host,
+                    remediation="Разрешите AXFR только доверенным secondary DNS по ACL/TSIG.",
+                    cwe=["CWE-200"],
+                    confidence="Высокая",
+                )
+            )
+        notes = []
+        if result["returncode"] not in {0, 1}:
+            notes.append(f"DNSRecon завершился с предупреждением: {result['stderr'][-400:]}")
+        return {
+            "assets": {
+                "subdomains": domain_assets(subdomains),
+                "dnsrecon": data or {"stdout_tail": result["stdout"][-2000:]},
+                "external_reports": [{"tool": self.label, "path": str(out)}],
+            },
+            "findings": findings,
+            "notes": notes,
+        }
+
+
+class KnockpyAdapter:
+    key = "knockpy"
+    label = "Knockpy"
+
+    def run(self, ctx: ScanContext) -> dict[str, Any]:
+        path = find_tool_binary(self.key)
+        if not path:
+            return {
+                "assets": {"knockpy_lite": {"fallback": "covered by Built-in DNS", "words": len(COMMON_SUBDOMAINS)}},
+                "findings": [],
+                "notes": ["Knockpy не найден; использован встроенный wildcard-aware перебор короткого списка поддоменов."],
+            }
+        cmd = [
+            path,
+            "-d",
+            ctx.host,
+            "--recon",
+            "--bruteforce",
+            "--threads",
+            "120",
+            "--timeout",
+            "2",
+            "--json",
+        ]
+        result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS[self.key], env=tool_environment(self.key))
+        data = parse_json_output(result["stdout"])
+        combined = json.dumps(data, ensure_ascii=False) + "\n" + result["stdout"]
+        subdomains = extract_domains(combined, ctx.host)
+        notes = []
+        if result["returncode"] not in {0, 1}:
+            notes.append(f"Knockpy завершился с предупреждением: {result['stderr'][-400:]}")
+        return {
+            "assets": {"subdomains": domain_assets(subdomains), "knockpy": data or {"stdout_tail": result["stdout"][-2000:]}},
+            "findings": interesting_subdomain_findings(subdomains, self.label),
+            "notes": notes,
+        }
+
+
+class AltdnsAdapter:
+    key = "altdns"
+    label = "Altdns"
+
+    def run(self, ctx: ScanContext, current_subdomains: list[Any] | None = None) -> dict[str, Any]:
+        seeds = sorted(
+            {
+                item.get("host", "") if isinstance(item, dict) else str(item)
+                for item in (current_subdomains or [])
+                if (item.get("host", "") if isinstance(item, dict) else str(item)).endswith("." + ctx.host)
+            }
+        )
+        if not seeds:
+            seeds = [f"www.{ctx.host}", f"api.{ctx.host}", f"dev.{ctx.host}"]
+        path = find_tool_binary(self.key)
+        if not path:
+            found = builtin_subdomain_mutations(ctx.host, seeds)
+            return {
+                "assets": {"subdomains": domain_assets(found), "mutated_subdomains": found, "altdns_lite": {"seed_count": len(seeds)}},
+                "findings": interesting_subdomain_findings(found, "Altdns-lite"),
+                "notes": ["Altdns не найден; выполнены ограниченные встроенные мутации поддоменов."],
+            }
+        words = WORDLIST_DIR / "mutations.txt"
+        with tempfile.TemporaryDirectory(prefix="bdu_altdns_") as tmp:
+            tmp_dir = Path(tmp)
+            inputs = tmp_dir / "subdomains.txt"
+            generated = tmp_dir / "generated.txt"
+            resolved = tmp_dir / "resolved.txt"
+            inputs.write_text("\n".join(seeds), encoding="utf-8")
+            cmd = [path, "-i", str(inputs), "-o", str(generated), "-w", str(words), "-r", "-s", str(resolved), "-t", "10"]
+            result = run_scanner_command(ctx, self.label, cmd, EXTERNAL_TIMEOUTS[self.key], env=tool_environment(self.key))
+            text = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else result["stdout"]
+        found = extract_domains(text, ctx.host)
+        notes = []
+        if result["returncode"] not in {0, 1}:
+            notes.append(f"Altdns завершился с предупреждением: {result['stderr'][-400:]}")
+        return {
+            "assets": {"subdomains": domain_assets(found), "mutated_subdomains": found, "altdns": {"seed_count": len(seeds), "found": found}},
+            "findings": interesting_subdomain_findings(found, self.label),
+            "notes": notes,
+        }
+
+
+class BurpLiteAdapter:
+    key = "burp_lite"
     label = "Burp-lite"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
@@ -1024,21 +3021,31 @@ class BurpAdapter:
         return {
             "assets": {"burp_lite": assets},
             "findings": findings,
-            "notes": ["Burp Suite не подключён как GUI/Proxy, использован встроенный Burp-lite пассивный анализ."],
+            "notes": ["Выполнен встроенный Burp-lite: пассивная карта сайта, анализ форм и CSRF-эвристики."],
         }
 
 
 class SkipFishAdapter:
     key = "skipfish"
-    label = "SkipFish-lite"
+    label = "SkipFish"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        path = shutil.which("skipfish")
+        path = find_tool_binary("skipfish")
         if path:
             out_dir = REPORTS_DIR / f"skipfish_{ctx.scan_id}"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [path, "-o", str(out_dir), "-W", str(WORDLIST_DIR / "web_common.txt"), ctx.target_url]
-            result = run_command(cmd, 180)
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            dictionary = SCANNER_SOURCE_DIRS["skipfish"] / "dictionaries" / ("complete.wl" if ctx.wait_for_completion else "minimal.wl")
+            cmd = [path, "-o", str(out_dir), "-S", str(dictionary), ctx.target_url]
+            result = run_scanner_command(ctx, self.label, cmd, 180, cwd=SCANNER_SOURCE_DIRS["skipfish"])
+            if result.get("timed_out"):
+                findings, assets = builtin_skipfish_lite(ctx)
+                return {
+                    "assets": {"skipfish_lite": assets, "external_reports": [{"tool": "SkipFish", "path": str(out_dir)}]} if out_dir.exists() else {"skipfish_lite": assets},
+                    "findings": findings,
+                    "notes": [scanner_timeout_note(self.label, result), "После предельного лимита выполнен встроенный SkipFish-lite web-crawl."],
+                    "status": "timeout",
+                }
             if result["returncode"] == 0:
                 return {
                     "assets": {"external_reports": [{"tool": "SkipFish", "path": str(out_dir)}]},
@@ -1046,10 +3053,13 @@ class SkipFishAdapter:
                     "notes": ["SkipFish выполнен, откройте HTML-отчёт в папке результата."],
                 }
         findings, assets = builtin_skipfish_lite(ctx)
+        failure_detail = ""
+        if path and 'result' in locals():
+            failure_detail = (result.get("stderr") or result.get("stdout") or "")[-400:]
         return {
             "assets": {"skipfish_lite": assets},
             "findings": findings,
-            "notes": ["SkipFish CLI не найден или не завершился, использован встроенный SkipFish-lite web-crawl."],
+            "notes": [f"SkipFish CLI не найден или не завершился, использован встроенный SkipFish-lite web-crawl. {failure_detail}".strip()],
         }
 
 
@@ -1058,10 +3068,7 @@ class LegionAdapter:
     label = "Legion-lite"
 
     def run(self, ctx: ScanContext) -> dict[str, Any]:
-        if "nmap" in ctx.selected_tools:
-            port_findings, port_assets = [], {"skipped": "network baseline covered by Nmap"}
-        else:
-            port_findings, port_assets = socket_port_scan(ctx.host)
+        port_findings, port_assets = socket_port_scan(ctx.host)
         tech_findings, tech_assets = builtin_technology_fingerprint(ctx)
         nikto_findings, nikto_assets = builtin_nikto_lite(ctx)
         findings = port_findings + tech_findings + nikto_findings
@@ -1198,6 +3205,60 @@ def post_json(
     return response
 
 
+def post_form(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    verify_tls: bool = True,
+) -> dict[str, Any]:
+    """POST application/x-www-form-urlencoded, как обычная HTML-форма.
+
+    Универсальнее JSON: доходит и до эндпоинтов, читающих request.form напрямую,
+    и до тех, что принимают как форму, так и JSON.
+    """
+    request_headers = {
+        "User-Agent": "BDU-Domain-Analyzer/1.0 authorized-security-check",
+        "Accept": "application/json,text/html,*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    request_headers.update(headers or {})
+    encoded = urlencode({key: ("" if value is None else str(value)) for key, value in payload.items()})
+    req = urllib.request.Request(
+        url,
+        data=encoded.encode("utf-8"),
+        method="POST",
+        headers=request_headers,
+    )
+    try:
+        response = _open_request(req, 80_000, verify_tls=verify_tls)
+    except urllib.error.HTTPError as exc:
+        body = exc.read(80_000).decode("utf-8", errors="replace")
+        response = {
+            "status": exc.code,
+            "final_url": exc.url,
+            "headers": dict(exc.headers.items()) if exc.headers else {},
+            "set_cookies": exc.headers.get_all("Set-Cookie", []) if exc.headers else [],
+            "body": body,
+            "content_type": exc.headers.get("Content-Type", "") if exc.headers else "",
+        }
+    except urllib.error.URLError as exc:
+        if verify_tls and _looks_like_tls_verify_error(exc):
+            fallback = post_form(url, payload, headers=headers, verify_tls=False)
+            fallback["tls_verification_bypassed"] = True
+            fallback["verify_error"] = str(exc)
+            return fallback
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    body = response.get("body", "")
+    try:
+        response["json"] = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        response["json"] = None
+    return response
+
+
 def _open_request(req: urllib.request.Request, read_limit: int, verify_tls: bool = True) -> dict[str, Any]:
     context = None if verify_tls else ssl._create_unverified_context()
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=context) as response:
@@ -1237,6 +3298,132 @@ def dig_records(name: str, record_type: str) -> list[str]:
         except socket.gaierror:
             return []
     return []
+
+
+def check_zone_transfers(host: str, nameservers: list[str]) -> list[dict[str, Any]]:
+    dig = shutil.which("dig")
+    if not dig:
+        return []
+    results: list[dict[str, Any]] = []
+    for raw_nameserver in nameservers[:8]:
+        nameserver = raw_nameserver.split()[-1].rstrip(".")
+        cmd = [dig, "+time=3", "+tries=1", f"@{nameserver}", host, "AXFR"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8, check=False)
+            output = proc.stdout
+            lower = (output + proc.stderr).lower()
+            allowed = proc.returncode == 0 and (
+                "xfr size:" in lower
+                or (output.lower().count("\tsoa\t") >= 2 and "transfer failed" not in lower)
+            )
+            results.append(
+                {
+                    "nameserver": nameserver,
+                    "allowed": allowed,
+                    "status": "allowed" if allowed else "refused_or_unavailable",
+                }
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"nameserver": nameserver, "allowed": False, "status": f"error: {str(exc)[:160]}"})
+    return results
+
+
+def parse_json_output(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    candidates: list[Any] = []
+    for match in re.finditer(r"[\[{]", stripped):
+        try:
+            value, _ = decoder.raw_decode(stripped[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            candidates.append(value)
+    return max(candidates, key=lambda item: len(json.dumps(item, ensure_ascii=False)), default={})
+
+
+def extract_domains(text: str, root_domain: str) -> list[str]:
+    root = root_domain.lower().strip(".")
+    pattern = re.compile(rf"(?i)(?<![a-z0-9_-])(?:[a-z0-9_](?:[a-z0-9_-]{{0,61}}[a-z0-9])?\.)+{re.escape(root)}(?![a-z0-9_-])")
+    domains = {match.group(0).lower().rstrip(".") for match in pattern.finditer(text)}
+    domains.discard(root)
+    return sorted(domains)
+
+
+def extract_emails(text: str, root_domain: str) -> list[str]:
+    pattern = re.compile(rf"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{{|}}~-]+@(?:[a-z0-9-]+\.)*{re.escape(root_domain)}\b")
+    return sorted({match.group(0).lower() for match in pattern.finditer(text)})
+
+
+def domain_assets(domains: list[str]) -> list[dict[str, Any]]:
+    return [{"host": host, "source": "external"} for host in sorted(set(domains))]
+
+
+def interesting_subdomain_findings(domains: list[str], scanner: str) -> list[Finding]:
+    findings: list[Finding] = []
+    interesting = {"admin", "dev", "test", "stage", "staging", "vpn", "sso", "internal", "intranet"}
+    for host in domains:
+        label = host.split(".", 1)[0].lower()
+        if label not in interesting:
+            continue
+        findings.append(
+            Finding(
+                f"Найден служебный поддомен {host}",
+                "Инфо",
+                "Subdomain discovery",
+                scanner,
+                "Служебное имя расширяет поверхность проверки и требует отдельного контроля доступа и обновлений.",
+                evidence=host,
+                remediation="Проверьте назначение поддомена, аутентификацию, сетевые ограничения и актуальность сервиса.",
+                cwe=["CWE-200"],
+            )
+        )
+    return findings
+
+
+def dnsrecon_axfr_detected(data: Any, stdout: str) -> bool:
+    text = json.dumps(data, ensure_ascii=False).lower() + "\n" + stdout.lower()
+    positive = ["zone transfer was successful", "zone transfer successful", '"type": "axfr"', "axfr successful"]
+    negative = ["axfr failed", "zone transfer failed", "axfr was not successful"]
+    return any(marker in text for marker in positive) and not any(marker in text for marker in negative)
+
+
+def builtin_subdomain_mutations(root_domain: str, seeds: list[str]) -> list[str]:
+    words_path = WORDLIST_DIR / "mutations.txt"
+    try:
+        words = [line.strip() for line in words_path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
+    except OSError:
+        words = ["dev", "test", "stage", "staging", "prod", "old", "new", "api", "internal"]
+    candidates: set[str] = set()
+    for seed in seeds[:30]:
+        relative = seed.lower().removesuffix("." + root_domain.lower()).strip(".")
+        if not relative:
+            continue
+        for word in words[:24]:
+            candidates.add(f"{word}-{relative}.{root_domain}")
+            candidates.add(f"{relative}-{word}.{root_domain}")
+            candidates.add(f"{word}.{relative}.{root_domain}")
+    limited = sorted(candidates)[:180]
+    wildcard_host = f"bdu-mut-{uuid.uuid4().hex[:10]}.{root_domain}"
+    wildcard = set(dig_records(wildcard_host, "A") + dig_records(wildcard_host, "CNAME"))
+
+    def resolve(name: str) -> tuple[str, set[str]]:
+        return name, set(dig_records(name, "A") + dig_records(name, "CNAME"))
+
+    found: list[str] = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(resolve, name) for name in limited]
+        for future in as_completed(futures):
+            name, values = future.result()
+            if values and (not wildcard or values != wildcard):
+                found.append(name)
+    return sorted(found)
 
 
 def analyze_transport_and_session(ctx: ScanContext, response: dict[str, Any], http_info: dict[str, Any]) -> list[Finding]:
@@ -1559,68 +3746,226 @@ def _name_tuple(parts: Any) -> str:
     return ", ".join(flattened)
 
 
-def run_command(cmd: list[str], timeout: int) -> dict[str, Any]:
+def run_command(
+    cmd: list[str],
+    timeout: float | None,
+    env: dict[str, str] | None = None,
+    progress: Callable[[str], None] | None = None,
+    heartbeat_seconds: float = 15.0,
+    cwd: Path | str | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-        return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-    except subprocess.TimeoutExpired as exc:
-        return {"returncode": 124, "stdout": exc.stdout or "", "stderr": f"Timeout after {timeout}s"}
+        popen_options: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": env,
+            "cwd": str(cwd) if cwd else None,
+        }
+        if os.name == "posix":
+            popen_options["start_new_session"] = True
+        elif os.name == "nt":
+            popen_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(cmd, **popen_options)
+        while True:
+            elapsed = time.monotonic() - started
+            remaining = timeout - elapsed if timeout is not None else None
+            if remaining is not None and remaining <= 0:
+                terminate_process_tree(proc)
+                stdout, stderr = proc.communicate()
+                detail = f"Timeout after {timeout:g}s; process tree terminated"
+                return {
+                    "returncode": 124,
+                    "stdout": command_text(stdout),
+                    "stderr": command_text(stderr) + "\n" + detail,
+                    "timed_out": True,
+                    "timeout": timeout,
+                }
+            try:
+                wait_slice = heartbeat_seconds if remaining is None else min(heartbeat_seconds, remaining)
+                stdout, stderr = proc.communicate(timeout=wait_slice)
+                return {"returncode": proc.returncode, "stdout": command_text(stdout), "stderr": command_text(stderr), "timed_out": False}
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - started
+                if progress:
+                    if timeout is None:
+                        progress(f"выполняется {int(elapsed)} с, ожидаю штатного завершения")
+                    elif elapsed < timeout:
+                        progress(f"выполняется {int(elapsed)} с из {int(timeout)} с")
     except Exception as exc:
-        return {"returncode": 127, "stdout": "", "stderr": str(exc)}
+        return {"returncode": 127, "stdout": "", "stderr": str(exc), "timed_out": False}
+
+
+def command_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def log_component_exception(label: str, exc: Exception) -> None:
+    configure_logging()
+    LOGGER.exception("%s: необработанная ошибка %s: %s", label, type(exc).__name__, exc)
+
+
+def terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=2)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+        proc.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def full_completion_timeout(key: str, fallback: float) -> float:
+    return float(FULL_COMPLETION_TIMEOUTS.get(key, max(int(fallback) * 4, int(fallback) + 300)))
+
+
+def scanner_key_from_label(label: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "", label.lower())
+    aliases = {
+        "nmap": "nmap",
+        "wapiti": "wapiti",
+        "wfuzz": "wfuzz",
+        "whatweb": "whatweb",
+        "nikto": "nikto",
+        "sqlmap": "sqlmap",
+        "theharvester": "theharvester",
+        "dnsrecon": "dnsrecon",
+        "knockpy": "knockpy",
+        "altdns": "altdns",
+        "burplite": "burp_lite",
+        "skipfish": "skipfish",
+        "skipfishlite": "skipfish",
+        "legionlite": "legion",
+        "openvaslite": "openvas",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def run_scanner_command(
+    ctx: ScanContext,
+    label: str,
+    cmd: list[str],
+    timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: Path | str | None = None,
+) -> dict[str, Any]:
+    progress_id = ctx.progress_id or ctx.scan_id
+    effective_timeout = full_completion_timeout(scanner_key_from_label(label), timeout) if ctx.wait_for_completion else timeout
+    return run_command(
+        cmd,
+        effective_timeout,
+        env=env,
+        cwd=cwd,
+        progress=(lambda message: emit(progress_id, f"{label}: {message}")) if progress_id else None,
+    )
 
 
 def parse_nmap_xml(xml_text: str) -> tuple[list[Finding], dict[str, Any]]:
     findings: list[Finding] = []
-    assets: dict[str, Any] = {"ports": []}
+    assets: dict[str, Any] = {"ports": [], "hosts": []}
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
         return findings, assets
-    for port in root.findall(".//port"):
-        state = port.find("state")
-        if state is None or state.get("state") != "open":
-            continue
-        service = port.find("service")
-        service_name = service.get("name", "") if service is not None else ""
-        product = service.get("product", "") if service is not None else ""
-        version = service.get("version", "") if service is not None else ""
-        port_item = {
-            "port": port.get("portid"),
-            "protocol": port.get("protocol"),
-            "service": service_name,
-            "product": product,
-            "version": version,
-        }
-        assets["ports"].append(port_item)
-        if service_name in {"ftp", "telnet", "rlogin", "vnc"}:
-            findings.append(
-                Finding(
-                    f"Открыт потенциально рискованный сервис {service_name}",
-                    "Средний",
-                    "Network exposure",
-                    "Nmap",
-                    "Сервис часто требует дополнительной защиты, шифрования или ограничения доступа.",
-                    evidence=json.dumps(port_item, ensure_ascii=False),
-                    remediation="Ограничьте доступ по ACL/VPN, включите шифрование или отключите сервис, если он не нужен.",
-                    cwe=["CWE-284"],
+    for host_node in root.findall(".//host"):
+        status_node = host_node.find("status")
+        status = status_node.get("state", "unknown") if status_node is not None else "unknown"
+        address_node = host_node.find("address[@addrtype='ipv4']")
+        if address_node is None:
+            address_node = host_node.find("address[@addrtype='ipv6']")
+        if address_node is None:
+            address_node = host_node.find("address")
+        address = address_node.get("addr", "") if address_node is not None else ""
+        hostnames = [node.get("name", "") for node in host_node.findall("./hostnames/hostname") if node.get("name")]
+        mac_node = host_node.find("address[@addrtype='mac']")
+        host_ports: list[dict[str, Any]] = []
+        for port in host_node.findall("./ports/port"):
+            state = port.find("state")
+            if state is None or state.get("state") != "open":
+                continue
+            service = port.find("service")
+            service_name = service.get("name", "") if service is not None else ""
+            product = service.get("product", "") if service is not None else ""
+            version = service.get("version", "") if service is not None else ""
+            port_item = {
+                "host": address,
+                "port": int(port.get("portid", "0") or 0),
+                "protocol": port.get("protocol"),
+                "service": service_name,
+                "product": product,
+                "version": version,
+            }
+            host_ports.append(port_item)
+            assets["ports"].append(port_item)
+            if service_name in {"ftp", "telnet", "rlogin", "vnc"}:
+                findings.append(
+                    Finding(
+                        f"Открыт потенциально рискованный сервис {service_name}: {address}",
+                        "Средний",
+                        "Network exposure",
+                        "Nmap",
+                        "Сервис часто требует дополнительной защиты, шифрования или ограничения доступа.",
+                        evidence=json.dumps(port_item, ensure_ascii=False),
+                        remediation="Ограничьте доступ по ACL/VPN, включите шифрование или отключите сервис, если он не нужен.",
+                        cwe=["CWE-284"],
+                    )
                 )
-            )
-        banner = " ".join([service_name, product, version])
-        cves = extract_cves(banner)
-        if cves:
-            findings.append(
-                Finding(
-                    f"Nmap обнаружил CVE в баннере {service_name}",
-                    "Высокий",
-                    "Known vulnerabilities",
-                    "Nmap",
-                    "В выводе Nmap найден CVE-идентификатор.",
-                    evidence=banner,
-                    remediation="Проверьте версию сервиса и примените обновления производителя.",
-                    cwe=["CWE-1104"],
-                    cve=cves,
+            banner = " ".join([service_name, product, version])
+            cves = extract_cves(banner)
+            if cves:
+                findings.append(
+                    Finding(
+                        f"Nmap обнаружил CVE в баннере {service_name}: {address}",
+                        "Высокий",
+                        "Known vulnerabilities",
+                        "Nmap",
+                        "В выводе Nmap найден CVE-идентификатор.",
+                        evidence=banner,
+                        remediation="Проверьте версию сервиса и примените обновления производителя.",
+                        cwe=["CWE-1104"],
+                        cve=cves,
+                    )
                 )
-            )
+        os_matches = [
+            {"name": node.get("name", ""), "accuracy": node.get("accuracy", "")}
+            for node in host_node.findall("./os/osmatch")[:5]
+        ]
+        heuristic_os, roles, confidence = infer_system_profile(host_ports)
+        nmap_os_guess = os_matches[0]["name"] if os_matches else heuristic_os
+        legion_profile = legion_device_profile(host_ports, hostname=hostnames[0] if hostnames else "", os_match=nmap_os_guess)
+        assets["hosts"].append(
+            {
+                "ip": address,
+                "status": status,
+                "hostnames": hostnames,
+                "mac": mac_node.get("addr", "") if mac_node is not None else "",
+                "vendor": mac_node.get("vendor", "") if mac_node is not None else "",
+                "os_matches": os_matches,
+                "os_guess": nmap_os_guess,
+                "os_confidence": (os_matches[0]["accuracy"] + "%") if os_matches else confidence,
+                "roles": roles,
+                "device_categories": legion_profile.get("device_categories", []),
+                "legion_classification": legion_profile.get("classification", []),
+                "open_ports": host_ports,
+            }
+        )
     return findings, assets
 
 
@@ -1688,8 +4033,8 @@ def normalize_single_finding(item: Finding) -> Finding:
         item.title = "Обнаружены TCP-ответы на потенциально рискованных портах"
         item.severity = "Низкий"
         item.confidence = "Низкая"
-        item.description = "Встроенный socket fallback получил TCP-ответы на портах, которые часто относятся к административным или серверным сервисам. Это эвристика: она не подтверждает протокол и должна проверяться Nmap/OpenVAS."
-        item.remediation = "Подтвердите сервисы инструментом Nmap/OpenVAS. Если эти сервисы действительно опубликованы наружу, ограничьте доступ по ACL/VPN или закройте публикацию."
+        item.description = "Встроенный socket fallback получил TCP-ответы на портах, которые часто относятся к административным или серверным сервисам. Это эвристика: она не подтверждает протокол и должна проверяться Nmap."
+        item.remediation = "Подтвердите сервисы инструментом Nmap. Если эти сервисы действительно опубликованы наружу, ограничьте доступ по ACL/VPN или закройте публикацию."
     if "nikto-like endpoint" in title_lower and item.severity == "Инфо":
         item.confidence = "Низкая"
     if "найден путь /.env" in title_lower and "status\": 200" not in item.evidence:
@@ -1769,14 +4114,265 @@ def socket_port_scan(host: str) -> tuple[list[Finding], dict[str, Any]]:
                 "Низкий",
                 "Network exposure",
                 "Socket port scan",
-                "Встроенный socket fallback получил TCP-ответы на портах, которые часто относятся к административным или серверным сервисам. Это эвристика: она не подтверждает протокол и должна проверяться Nmap/OpenVAS.",
+                "Встроенный socket fallback получил TCP-ответы на портах, которые часто относятся к административным или серверным сервисам. Это эвристика: она не подтверждает протокол и должна проверяться Nmap.",
                 evidence=json.dumps(risky, ensure_ascii=False),
-                remediation=f"Подтвердите сервисы инструментом Nmap/OpenVAS. Если действительно открыты {ports}, ограничьте доступ по ACL/VPN или закройте публикацию.",
+                remediation=f"Подтвердите сервисы инструментом Nmap. Если действительно открыты {ports}, ограничьте доступ по ACL/VPN или закройте публикацию.",
                 cwe=["CWE-284"],
                 confidence="Низкая",
             )
         )
     return findings, assets
+
+
+def scan_host_ports(host: str, ports: list[int], timeout: float = 0.35) -> list[dict[str, Any]]:
+    open_ports: list[dict[str, Any]] = []
+    for port in ports:
+        service = service_name_for_port(port)
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                banner = read_service_banner(sock, host, port, service)
+                item: dict[str, Any] = {"port": port, "protocol": "tcp", "service": service}
+                if banner:
+                    item["banner"] = banner
+                open_ports.append(item)
+        except OSError:
+            continue
+    return open_ports
+
+
+def discover_tcp_ports(
+    host: str,
+    *,
+    exclude: set[int] | None = None,
+    timeout: float = FULL_TCP_SCAN_TIMEOUT,
+    workers: int = FULL_TCP_SCAN_WORKERS,
+) -> list[dict[str, Any]]:
+    excluded = exclude or set()
+    ports = [port for port in range(FULL_TCP_PORT_MIN, FULL_TCP_PORT_MAX + 1) if port not in excluded]
+    open_ports: list[dict[str, Any]] = []
+
+    def probe(port: int) -> dict[str, Any] | None:
+        service = service_name_for_port(port)
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                banner = read_service_banner(sock, host, port, service)
+                item: dict[str, Any] = {"port": port, "protocol": "tcp", "service": service}
+                if banner:
+                    item["banner"] = banner
+                return item
+        except OSError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        for batch in chunked(ports, 4096):
+            futures = [executor.submit(probe, port) for port in batch]
+            for future in as_completed(futures):
+                try:
+                    item = future.result()
+                except Exception:
+                    item = None
+                if item:
+                    open_ports.append(item)
+    open_ports.sort(key=lambda item: int(item["port"]))
+    return open_ports
+
+
+def dedupe_port_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, int], dict[str, Any]] = {}
+    for item in records:
+        try:
+            port = int(item.get("port", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        protocol = str(item.get("protocol") or "tcp")
+        key = (protocol, port)
+        current = merged.get(key)
+        if not current:
+            merged[key] = item
+        elif not current.get("banner") and item.get("banner"):
+            merged[key] = {**current, **item}
+        elif current.get("service") == "unknown" and item.get("service") != "unknown":
+            merged[key] = {**current, **item}
+    return sorted(merged.values(), key=lambda item: int(item.get("port", 0) or 0))
+
+
+def service_name_for_port(port: int) -> str:
+    if port in COMMON_TCP_PORTS:
+        return COMMON_TCP_PORTS[port]
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "unknown"
+
+
+def chunked(values: list[int], size: int):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def target_url_port(target_url: str) -> int | None:
+    try:
+        return urlparse(target_url).port
+    except ValueError:
+        return None
+
+
+def read_service_banner(sock: socket.socket, host: str, port: int, service: str) -> str:
+    try:
+        sock.settimeout(0.25)
+        if port in {80, 8080}:
+            sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode("ascii", errors="ignore"))
+        elif service not in {"ssh", "ftp", "smtp", "pop3", "imap"}:
+            return ""
+        data = sock.recv(512)
+    except OSError:
+        return ""
+    clean = " ".join(data.decode("utf-8", errors="replace").split())
+    return clean[:220]
+
+
+def reverse_hostname(address: str) -> str:
+    try:
+        hostname, _aliases, _addresses = socket.gethostbyaddr(address)
+        return hostname.rstrip(".")
+    except (OSError, socket.herror):
+        return ""
+
+
+def local_arp_entry(address: str) -> dict[str, str]:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return {}
+    if ip.version != 4 or not (ip.is_private or ip.is_link_local):
+        return {}
+    try:
+        proc = subprocess.run(["arp", "-n", address], capture_output=True, text=True, timeout=0.8, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    text = f"{proc.stdout}\n{proc.stderr}"
+    mac_match = re.search(r"(?:at\s+|\s)([0-9a-f]{2}(?::[0-9a-f]{2}){5})(?:\s|$)", text, re.I)
+    interface_match = re.search(r"\bon\s+([^\s]+)", text)
+    return {
+        "mac": mac_match.group(1).lower() if mac_match else "",
+        "interface": interface_match.group(1) if interface_match else "",
+    }
+
+
+def infer_system_profile(open_ports: list[dict[str, Any]]) -> tuple[str, list[str], str]:
+    ports = {int(item.get("port", 0)) for item in open_ports}
+    services = {str(item.get("service", "")) for item in open_ports}
+    banners = " ".join(str(item.get("banner", "")) for item in open_ports).lower()
+    roles: list[str] = []
+    if ports & WEB_PORTS or any(service.startswith("http") for service in services):
+        roles.append("web-сервер/панель")
+    if ports & DATABASE_PORTS:
+        roles.append("сервер баз данных")
+    if ports & {53}:
+        roles.append("DNS-сервер")
+    if ports & {88, 389, 636}:
+        roles.append("служба каталогов/аутентификации")
+    if ports & {25, 465, 587, 110, 143, 993, 995}:
+        roles.append("почтовый сервер")
+    if ports & {445, 139}:
+        roles.append("файловый сервер SMB")
+    if ports & {3389, 5985, 5986}:
+        roles.append("узел удалённого администрирования")
+    if ports & {631, 9100}:
+        roles.append("принтер/сетевое устройство")
+    if ports & {111, 2049}:
+        roles.append("NFS/RPC-файловый сервер")
+    if ports & {2375, 2376, 6443, 10250}:
+        roles.append("контейнерная платформа")
+
+    if ports & WINDOWS_PORTS or "microsoft" in banners or "windows" in banners:
+        return "Windows / Windows Server", roles, "Средняя"
+    if "ubuntu" in banners or "debian" in banners:
+        return "Linux (семейство Debian/Ubuntu)", roles, "Средняя"
+    if "openssh" in banners or 22 in ports:
+        return "Linux/Unix или сетевое устройство", roles, "Низкая"
+    if 9100 in ports:
+        return "Сетевое устройство/принтер", roles, "Средняя"
+    if open_ports:
+        return "Не определена по доступным сервисам", roles, "Низкая"
+    return "Нет данных", roles, "Низкая"
+
+
+def system_exposure_findings(record: dict[str, Any]) -> list[Finding]:
+    address = str(record.get("ip", ""))
+    ports = {int(item.get("port", 0)) for item in record.get("open_ports", [])}
+    findings: list[Finding] = []
+    groups = [
+        (ports & {21, 23}, "Открыт незашифрованный административный сервис", "Высокий", "Отключите FTP/Telnet или замените их на SSH/SFTP."),
+        (ports & {445, 3389, 5985, 5986, 5900}, "Доступен сервис удалённого администрирования", "Средний", "Ограничьте доступ доверенной подсетью, VPN и межсетевым экраном; включите MFA, где возможно."),
+        (ports & DATABASE_PORTS, "Доступен сетевой сервис базы данных", "Средний", "Закройте доступ из пользовательских сегментов и разрешите только нужным приложениям."),
+        (ports & {111, 2049}, "Доступен NFS/RPC-сервис", "Средний", "Проверьте export-политику NFS и ограничьте доступ доверенными адресами."),
+        (ports & {2375, 2376, 6443, 10250}, "Доступен интерфейс контейнерной платформы", "Высокий", "Ограничьте API Docker/Kubernetes управляющим сегментом и проверьте обязательную аутентификацию/TLS."),
+    ]
+    for exposed, title, severity, remediation in groups:
+        if not exposed:
+            continue
+        evidence = [item for item in record.get("open_ports", []) if int(item.get("port", 0)) in exposed]
+        findings.append(
+            Finding(
+                f"{title}: {address}",
+                severity,
+                "Network exposure",
+                "Built-in system inventory",
+                "Порт доступен по TCP. Определение сервиса является эвристикой и требует подтверждения по версии/баннеру.",
+                evidence=json.dumps(evidence, ensure_ascii=False),
+                remediation=remediation,
+                cwe=["CWE-284"],
+                confidence="Средняя" if any(item.get("banner") for item in evidence) else "Низкая",
+            )
+        )
+    return findings
+
+
+def incompatible_tool_note(key: str, target_kind: str) -> str:
+    domain_only = {"theharvester", "dnsrecon", "knockpy", "altdns"}
+    web_only = {"wapiti", "wfuzz", "whatweb", "nikto", "sqlmap", "burp_lite", "skipfish"}
+    if target_kind == "filesystem":
+        return f"{key}: пропущен для файловой цели; используйте встроенный аудит файловой системы, ClamAV/YARA и затем отдельно анализируйте найденные web-узлы."
+    if target_kind != "domain" and key in domain_only:
+        return f"{key}: пропущен — инструмент требует доменное имя, а выбрана не доменная цель."
+    if target_kind == "network" and key in web_only | {"legion"}:
+        return f"{key}: пропущен для CIDR-цели; используйте Nmap и встроенную инвентаризацию, затем анализируйте найденный web-узел отдельно."
+    return ""
+
+
+def scanner_run_record(label: str, key: str, result: dict[str, Any], duration: float) -> dict[str, Any]:
+    notes = [str(item) for item in result.get("notes", [])]
+    note_text = " ".join(notes).lower()
+    explicit_status = str(result.get("status", "")).strip()
+    if explicit_status:
+        status = explicit_status
+    elif "пропущен" in note_text or "skipped" in note_text:
+        status = "skipped"
+    elif any(token in note_text for token in ["ошибка адаптера", "завершился с ошибкой", "завершился с предупреждением", "не завершился", "timeout", "таймаут"]):
+        status = "completed-with-fallback" if "использован" in note_text else "failed"
+    elif "не найден" in note_text and "использован" not in note_text:
+        status = "failed"
+    elif any(token in note_text for token in ["использован", "-lite", "fallback"]):
+        status = "completed-with-fallback"
+    else:
+        status = "completed"
+    runtime = scanner_runtime_details(key) if key != "built-in" else {
+        "origin": "built-in",
+        "source_used": True,
+        "executable": "Python module bdu_analyzer.scanners",
+    }
+    return {
+        "key": key,
+        "label": label,
+        "selected": key != "built-in",
+        "status": status,
+        "duration_seconds": round(duration, 2),
+        "origin": runtime.get("origin", ""),
+        "source_used": runtime.get("source_used", False),
+        "executable": runtime.get("executable", ""),
+        "notes": notes,
+    }
 
 
 def builtin_content_discovery(ctx: ScanContext, wordlist: Path) -> tuple[list[Finding], dict[str, Any]]:
@@ -2186,21 +4782,20 @@ def category_to_cwe(category: str) -> list[str]:
 
 
 def find_wapiti() -> str:
-    path = shutil.which("wapiti")
-    if path:
-        return path
-    if LEGACY_WAPITI_BIN.exists():
-        return str(LEGACY_WAPITI_BIN)
-    return ""
+    return find_tool_binary("wapiti")
 
 
 def _tool(name: str, key: str, mode: str, note: str, selected: set[str]) -> ToolStatus:
-    path = find_wapiti() if key == "wapiti" else shutil.which(key) or ""
+    path = find_wapiti() if key == "wapiti" else find_tool_binary(key)
+    if source_available(key):
+        note += f" Полный исходный код включён в third_party/{key}."
     return ToolStatus(name.upper() if key == "nmap" else name.capitalize(), key, bool(path), path, mode, note, key in selected)
 
 
 def _tool_with_fallback(name: str, key: str, note: str, fallback: str, selected: set[str]) -> ToolStatus:
-    path = shutil.which(key) or ""
+    path = find_tool_binary(key)
+    if source_available(key):
+        note += f" Полный исходный код включён в third_party/{key}."
     if path:
         return ToolStatus(name, key, True, path, "optional", note, key in selected)
     return ToolStatus(name, key, True, fallback, "fallback", f"{note} CLI не найден, будет использован Python fallback.", key in selected)
@@ -2214,8 +4809,10 @@ def _platform_with_fallback(
     fallback: str,
     selected: set[str],
 ) -> ToolStatus:
+    if source_available(key):
+        note += f" Полный исходный код включён в third_party/{key}."
     for candidate in candidates:
-        path = shutil.which(candidate)
+        path = find_tool_binary(candidate)
         if path:
             return ToolStatus(name, key, True, path, "optional", note, key in selected)
     return ToolStatus(name, key, True, fallback, "fallback", f"{note} Платформа не найдена, будет использован Python fallback.", key in selected)
